@@ -76,7 +76,7 @@ def accumulate_d8(fdir, weights, valid_mask):
 
     return accumulation_result.reshape(H, W).astype('float64')
 
-# --- 4) Data Retrieval Function (FIXED FOR NESTED ZIPS) ---
+# --- 4) Data Retrieval Function (FIXED FOR REDIRECTS) ---
 
 @st.cache_resource(show_spinner="Setting up data environment (Downloading files)...")
 def setup_data_environment():
@@ -94,19 +94,25 @@ def setup_data_environment():
         if not os.path.exists(local_path):
             st.info(f"Downloading {os.path.basename(local_path)}...")
             try:
-                # Add check for the correct Dropbox key structure
-                if 'rlkey=' in url and not url.endswith('&dl=1'):
-                    final_url = url + '&dl=1'
-                else:
-                    final_url = url
+                # Ensure direct download link structure
+                final_url = url
+                if '?dl=1' not in final_url and 'rlkey=' in final_url:
+                    final_url = final_url + '&dl=1' if '&dl=1' not in final_url else final_url
 
-                with requests.get(final_url, stream=True) as r:
+                # FIX: Explicitly allow redirects to correctly fetch binary data from Dropbox
+                with requests.get(final_url, stream=True, allow_redirects=True) as r:
                     r.raise_for_status()
+                    
+                    # Optional Check: Ensure we didn't accidentally download HTML
+                    if 'content-type' in r.headers and 'text/html' in r.headers['content-type'].lower():
+                         st.error(f"Download Error: Received HTML/text instead of binary file for {os.path.basename(local_path)}. Dropbox link is likely not configured for direct download.")
+                         raise requests.exceptions.HTTPError("Did not receive binary file.")
+                         
                     with open(local_path, 'wb') as f:
                         for chunk in r.iter_content(chunk_size=8192):
                             f.write(chunk)
             except Exception as e:
-                st.error(f"Failed to download {os.path.basename(local_path)}. Please verify the direct Dropbox link (`?dl=1`).")
+                st.error(f"Failed to download {os.path.basename(local_path)}. Please verify the direct Dropbox link (`?dl=1`) and try again.")
                 raise
 
     download_file(DEM_URL, local_dem_path)
@@ -129,7 +135,7 @@ def setup_data_environment():
             with zipfile.ZipFile(zip_path) as zip_ref:
                 zip_ref.extractall(local_parcels_dir) 
             
-            # --- FIX: Recursively search for the .shp file (handles nested folders) ---
+            # Recursively search for the .shp file (handles nested folders)
             for root, _, files in os.walk(local_parcels_dir):
                 for file in files:
                     if file.endswith('.shp'):
@@ -137,7 +143,6 @@ def setup_data_environment():
                         break
                 if local_shp_path:
                     break
-            # --- END FIX ---
             
             if not local_shp_path:
                  st.error("Could not find a .shp file inside the zip archive, even after searching subdirectories. Ensure the zip contains all shapefile components (.shp, .shx, .dbf, etc.)")
@@ -149,7 +154,6 @@ def setup_data_environment():
             raise
 
     if not local_shp_path:
-        # This catch-all should ideally not be reached, but ensures robust failure.
         raise FileNotFoundError("Shapefile path could not be determined.")
 
     st.success(f"Data loaded successfully. Shapefile path: {local_shp_path}")
