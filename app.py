@@ -270,28 +270,35 @@ def main():
             center_x = parcels_wgs84.geometry.centroid.x.mean()
             center_y = parcels_wgs84.geometry.centroid.y.mean()
             
+            # FIX START: Explicitly convert the GeoDataFrame index to a property
+            # for the Choropleth matching to work with folium.
+            parcels_wgs84_indexed = parcels_wgs84.copy()
+            # Create a new column 'index' from the actual GeoDataFrame index, converting to string
+            parcels_wgs84_indexed['index'] = parcels_wgs84_indexed.index.astype(str) 
+
             # Create a Folium map
             m = folium.Map(location=[center_y, center_x], zoom_start=12, tiles="cartodbpositron")
 
             # Create Choropleth map based on FCI Score
             folium.Choropleth(
-                geo_data=parcels_wgs84.to_json(), 
+                geo_data=parcels_wgs84_indexed.to_json(), # Use the GeoJSON that includes the 'index' property
                 name='FCI Score',
-                data=parcels_wgs84,
-                columns=[parcels_wgs84.index, 'FCI'],
-                key_on='feature.properties.index', 
+                data=parcels_wgs84_indexed, # Pass the GDF that includes the 'index' column
+                columns=['index', 'FCI'], # Match the new 'index' column with the 'FCI' column
+                key_on='feature.properties.index', # Match against the 'index' property in the GeoJSON
                 fill_color='YlOrRd',
                 fill_opacity=0.7,
                 line_opacity=0.2,
                 legend_name=f'FCI Score (Rainfall: {rainfall_mm}mm)'
             ).add_to(m)
+            # FIX END
 
             # Add tooltips/popups for interaction
             style_function = lambda x: {'fillColor': '#ffffff', 'color':'#000000', 'fillOpacity': 0.1, 'weight': 0.1}
             highlight_function = lambda x: {'fillColor': '#000000', 'color':'#000000', 'fillOpacity': 0.50, 'weight': 0.1}
             
             NIL = folium.features.GeoJson(
-                parcels_wgs84.to_json(),
+                parcels_wgs84_indexed.to_json(), # Use the indexed GeoJSON for tooltips too
                 name=f'FCI Score - {rainfall_mm}mm',
                 style_function=style_function, 
                 highlight_function=highlight_function,
@@ -310,6 +317,7 @@ def main():
             
             # --- Data Table and Download ---
             st.write("### Top Results Data Table")
+            # Use the original parcels_gdf for the table display
             results_df = parcels_gdf[['FCI', 'fci_sum', 'fci_corr_sum', 'fci_p90', 'Rainfall_MM']].copy()
             st.dataframe(results_df.head(10).style.format({
                 'FCI': '{:.3f}', 
