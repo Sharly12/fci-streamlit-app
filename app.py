@@ -18,7 +18,7 @@ from pysheds.grid import Grid
 from collections import deque
 import streamlit as st
 import requests
-import zipfile
+import zipfile # Still imported, but not used
 from io import BytesIO
 import tempfile
 import folium
@@ -28,7 +28,9 @@ import pandas as pd
 
 # 2) Configuration - Dropbox Direct Download Links
 DEM_URL = "https://www.dropbox.com/scl/fi/lrzt81x0d501w948j6etu/Dem-demo.tif?rlkey=vyzxwmgo55pqvmem7xyn9emp1&st=j790cjgz&dl=1"
-PARCELS_ZIP_URL = "https://www.dropbox.com/scl/fi/ttyueg2et5m3xhfj46sda/Grid-20251120T051729Z-1-001.zip?rlkey=x0ygm4wmu95di177nxjyocp4&st=hir3h3ij&dl=1" # Corrected rlkey based on last working version
+# --- UPDATED: Switched from KML to GeoJSON for maximum compatibility. ---
+# NOTE: YOU MUST REPLACE THIS WITH YOUR ACTUAL GEOJSON DIRECT DOWNLOAD LINK
+PARCELS_GEOJSON_URL = "https://www.dropbox.com/scl/fi/dv1br78ds9mz7zdtwc1sr/grid-network.geojson?rlkey=rbq4kyi8u9nl4byzz7wu6rkq4&st=qiyefkny&dl=1" 
 CN_URL = "https://www.dropbox.com/scl/fi/xfseghib9vg31loxan294/CN.tif?rlkey=6o75z9l36l8viuiivxmgiame7&st=e7jfq1vi&dl=1"
 
 # Analysis parameters (Constants)
@@ -76,7 +78,7 @@ def accumulate_d8(fdir, weights, valid_mask):
 
     return accumulation_result.reshape(H, W).astype('float64')
 
-# --- 4) Data Retrieval Function (FIXED FOR REDIRECTS) ---
+# --- 4) Data Retrieval Function (Updated for single GeoJSON file) ---
 
 @st.cache_resource(show_spinner="Setting up data environment (Downloading files)...")
 def setup_data_environment():
@@ -86,9 +88,7 @@ def setup_data_environment():
 
     local_dem_path = os.path.join(data_dir, "Dem-demo.tif")
     local_cn_path = os.path.join(data_dir, "CN.tif")
-    local_parcels_dir = os.path.join(data_dir, "parcels_extracted")
-    
-    os.makedirs(local_parcels_dir, exist_ok=True)
+    local_parcels_path = os.path.join(data_dir, "parcels.geojson") # Single GeoJSON file path
     
     def download_file(url, local_path):
         if not os.path.exists(local_path):
@@ -99,7 +99,7 @@ def setup_data_environment():
                 if '?dl=1' not in final_url and 'rlkey=' in final_url:
                     final_url = final_url + '&dl=1' if '&dl=1' not in final_url else final_url
 
-                # FIX: Explicitly allow redirects to correctly fetch binary data from Dropbox
+                # Explicitly allow redirects to correctly fetch binary data from Dropbox
                 with requests.get(final_url, stream=True, allow_redirects=True) as r:
                     r.raise_for_status()
                     
@@ -117,49 +117,19 @@ def setup_data_environment():
 
     download_file(DEM_URL, local_dem_path)
     download_file(CN_URL, local_cn_path)
-
-    local_shp_path = None
     
-    # Check if a .shp file already exists in the extracted directory (from cache)
-    for root, _, files in os.walk(local_parcels_dir):
-        if any(f.endswith('.shp') for f in files):
-            local_shp_path = os.path.join(root, next(f for f in files if f.endswith('.shp')))
-            break
+    # --- GeoJSON Download Logic ---
+    download_file(PARCELS_GEOJSON_URL, local_parcels_path)
+    # --- End GeoJSON Download Logic ---
 
-    if not local_shp_path:
-        zip_path = os.path.join(data_dir, "parcels.zip")
-        download_file(PARCELS_ZIP_URL, zip_path)
-        
-        st.info("Extracting Parcels shapefile...")
-        try:
-            with zipfile.ZipFile(zip_path) as zip_ref:
-                zip_ref.extractall(local_parcels_dir) 
-            
-            # Recursively search for the .shp file (handles nested folders)
-            for root, _, files in os.walk(local_parcels_dir):
-                for file in files:
-                    if file.endswith('.shp'):
-                        local_shp_path = os.path.join(root, file)
-                        break
-                if local_shp_path:
-                    break
-            
-            if not local_shp_path:
-                 st.error("Could not find a .shp file inside the zip archive, even after searching subdirectories. Ensure the zip contains all shapefile components (.shp, .shx, .dbf, etc.)")
-                 raise FileNotFoundError("SHP file missing after extraction.")
-                 
-        except Exception as e:
-            st.error("Error during shapefile extraction.")
-            st.exception(e)
-            raise
+    if not os.path.exists(local_parcels_path):
+        # This will only happen if download_file raises an exception which isn't caught.
+        raise FileNotFoundError("Parcels GeoJSON file could not be downloaded or found.")
 
-    if not local_shp_path:
-        raise FileNotFoundError("Shapefile path could not be determined.")
+    st.success(f"Data loaded successfully. Parcels file path: {local_parcels_path}")
+    return local_dem_path, local_parcels_path, local_cn_path
 
-    st.success(f"Data loaded successfully. Shapefile path: {local_shp_path}")
-    return local_dem_path, local_shp_path, local_cn_path
-
-# --- 5) Core FCI Analysis Function (Updated to return GeoDataFrame) ---
+# --- 5) Core FCI Analysis Function (GeoPandas reads GeoJSON directly) ---
 
 @st.cache_data(show_spinner="Running Flow Corridor Importance (FCI) Analysis...")
 def run_fci_analysis(RAINFALL_MM, USE_NRCS_RUNOFF, DEM_PATH_IN, PARCELS_PATH, CN_RASTER_PATH):
@@ -223,6 +193,7 @@ def run_fci_analysis(RAINFALL_MM, USE_NRCS_RUNOFF, DEM_PATH_IN, PARCELS_PATH, CN
     corridor_accumulation = flow_accumulation * corridor_mask
 
     # --- Zonal Statistics and FCI Calculation ---
+    # GeoPandas reads GeoJSON directly via the PARCELS_PATH variable
     parcels = gpd.read_file(PARCELS_PATH)
     if parcels.crs.to_string() != dem_crs.to_string():
         parcels = parcels.to_crs(dem_crs)
@@ -265,9 +236,10 @@ def main():
     
     # 1. Setup Data
     try:
+        # PARCELS_PATH is now the GeoJSON file path
         DEM_PATH_IN, PARCELS_PATH, CN_RASTER_PATH = setup_data_environment()
     except Exception:
-        st.error("Failed to set up required geospatial data. Check your Dropbox link format or if the zip file contains necessary components.")
+        st.error("Failed to set up required geospatial data. Check your Dropbox link format or if the GeoJSON file link is correct.")
         return
 
     # 2. User Input Sidebar
