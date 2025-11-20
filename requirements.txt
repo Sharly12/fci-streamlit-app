@@ -1,0 +1,12 @@
+streamlit
+geopandas
+rasterio
+shapely
+fiona
+pyproj
+rasterstats
+pysheds
+numpy
+requests
+folium
+streamlit-folium
