@@ -1,195 +1,194 @@
+# app.py
+# Main Streamlit entrypoint – Hydrological Analysis Platform
+# Uses the built-in multipage system (pages/ folder) and page_link for navigation.
+# Currently only the FCI model page (pages/2_FCI_Analysis.py) is implemented.
+
 import streamlit as st
 
-# ---------- GLOBAL CONFIG ----------
 st.set_page_config(
     page_title="Hydrological Analysis Platform",
     page_icon="💧",
     layout="wide",
+    initial_sidebar_state="collapsed",
 )
 
-# ---------- STYLES ----------
+# -------------------------------------------------------------------
+# Hero / header
+# -------------------------------------------------------------------
 st.markdown(
     """
     <style>
+    .main-title {
+        font-size: 2.6rem;
+        font-weight: 700;
+        margin-bottom: 0.3rem;
+    }
+    .main-subtitle {
+        font-size: 1rem;
+        color: #cbd5f5;
+        max-width: 900px;
+    }
     .model-card {
-        border-radius: 18px;
-        padding: 18px 20px;
-        background-color: white;
-        border: 1px solid #e5e7eb;
-        box-shadow: 0 10px 15px -3px rgba(15,23,42,0.06);
-        transition: all 0.2s ease-in-out;
+        border-radius: 1.1rem;
+        padding: 1.2rem 1.4rem;
+        background-color: #111827;
+        border: 1px solid #1f2937;
     }
-    .model-card:hover {
-        border-color: #3b82f6;
-        box-shadow: 0 20px 25px -5px rgba(59,130,246,0.25);
-        transform: translateY(-2px);
+    .model-title {
+        font-weight: 600;
+        font-size: 1.05rem;
+        margin-bottom: 0.25rem;
     }
-    .metric-card {
-        border-radius: 14px;
-        padding: 16px;
-        background-color: white;
-        box-shadow: 0 8px 12px -4px rgba(15,23,42,0.06);
+    .model-acronym {
+        font-weight: 700;
+        font-size: 1.2rem;
+    }
+    .model-desc {
+        font-size: 0.90rem;
+        color: #d1d5db;
+    }
+    .small-tag {
+        font-size: 0.7rem;
+        letter-spacing: .08em;
+        text-transform: uppercase;
+        color: #9ca3af;
     }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-# ---------- MODEL METADATA ----------
-# IMPORTANT: page paths MUST match actual filenames in your `pages/` folder
+st.markdown("<div class='main-title'>Hydrological Analysis Platform</div>", unsafe_allow_html=True)
+st.markdown(
+    "<div class='main-subtitle'>Run individual models or perform comprehensive analysis to understand "
+    "flow corridors, storage roles, parcel sensitivity and exposure across your study area.</div>",
+    unsafe_allow_html=True,
+)
+st.write("")  # small spacer
+
+# -------------------------------------------------------------------
+# Model cards configuration
+# -------------------------------------------------------------------
 models_info = [
     {
         "id": "hsr",
-        "title": "Hydrological Storage Role",
         "acronym": "HSR",
+        "name": "Hydrological Storage Role",
         "emoji": "💧",
         "description": "Analyzes water storage capacity and retention patterns across the landscape.",
-        "page": "pages/1_HSR_Analysis.py",
+        "implemented": False,            # placeholder only
+        "page": None,
     },
     {
         "id": "fci",
-        "title": "Flow Corridor Importance",
         "acronym": "FCI",
+        "name": "Flow Corridor Importance",
         "emoji": "📈",
         "description": "Evaluates the significance of water flow pathways and corridor connectivity.",
-        "page": "pages/2_FCI_Analysis.py",
+        "implemented": True,             # THIS ONE IS LIVE
+        "page": "pages/2_FCI_Analysis.py",  # must match your real file name
     },
     {
         "id": "pec",
-        "title": "Parcel Elevation Context",
         "acronym": "PEC",
+        "name": "Parcel Elevation Context",
         "emoji": "⛰️",
         "description": "Assesses elevation-based risk factors and topographical context for each parcel.",
-        "page": "pages/3_PEC_Analysis.py",
+        "implemented": False,
+        "page": None,
     },
     {
         "id": "uds",
-        "title": "Upstream–Downstream Sensitivity",
         "acronym": "UDS",
+        "name": "Upstream–Downstream Sensitivity",
         "emoji": "🔁",
-        "description": "Measures the interdependence between upstream and downstream areas.",
-        "page": "pages/4_UDS_Analysis.py",
+        "description": "Measures interdependence between upstream and downstream areas.",
+        "implemented": False,
+        "page": None,
     },
     {
         "id": "sei",
-        "title": "Surrounding Exposure Index",
         "acronym": "SEI",
+        "name": "Surrounding Exposure Index",
         "emoji": "📍",
         "description": "Quantifies exposure levels based on surrounding environmental factors.",
-        "page": "pages/5_SEI_Analysis.py",
+        "implemented": False,
+        "page": None,
     },
 ]
 
-# ---------- HEADER ----------
-with st.container():
-    col_logo, col_title = st.columns([1, 6])
-    with col_logo:
-        st.markdown("### 💧")
-    with col_title:
-        st.title("Hydrological Analysis Platform")
-        st.write(
-            "Run individual models or perform comprehensive analysis to understand flow corridors, "
-            "storage roles, parcel sensitivity and exposure across your study area."
-        )
-
-st.markdown("---")
-
-# ---------- MODEL GRID ----------
 st.subheader("Analysis Models")
 
-cols = st.columns(3)
+cols = st.columns(3, gap="large")
+
 for i, model in enumerate(models_info):
     col = cols[i % 3]
     with col:
-        st.markdown(
-            f"""
-            <div class="model-card">
-                <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
-                    <div style="font-size:28px;">{model['emoji']}</div>
-                    <div>
-                        <div style="font-weight:700;font-size:18px;">{model['acronym']}</div>
-                        <div style="font-size:14px;color:#6b7280;">{model['title']}</div>
-                    </div>
-                </div>
-                <div style="font-size:13px;color:#4b5563;margin-bottom:12px;">
-                    {model['description']}
-                </div>
-            """,
-            unsafe_allow_html=True,
-        )
+        st.markdown("<div class='model-card'>", unsafe_allow_html=True)
 
-        btn_label = f"Run {model['acronym']} Analysis"
-        if st.button(btn_label, key=f"btn_{model['id']}"):
-            # Try to switch page programmatically
-            if hasattr(st, "switch_page"):
-                try:
-                    st.switch_page(model["page"])
-                except Exception as e:
-                    # Friendly fallback: don't crash the whole app
-                    st.error(
-                        "Navigation failed. "
-                        "Please open the page from the left sidebar.\n\n"
-                        f"Details: {e}"
-                    )
-            else:
-                st.info(
-                    "This Streamlit version does not support `st.switch_page`.\n\n"
-                    "Please use the left sidebar to select the page instead."
-                )
+        # header row
+        c1, c2 = st.columns([0.25, 0.75])
+        with c1:
+            st.markdown(
+                f"<div style='font-size: 1.8rem; text-align:center;'>{model['emoji']}</div>",
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                f"<div class='model-acronym' style='text-align:center;'>{model['acronym']}</div>",
+                unsafe_allow_html=True,
+            )
+        with c2:
+            st.markdown(
+                f"<div class='model-title'>{model['name']}</div>",
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                f"<div class='model-desc'>{model['description']}</div>",
+                unsafe_allow_html=True,
+            )
+
+        st.write("")
+
+        if model["implemented"] and model["page"] is not None:
+            # Use page_link instead of switch_page – avoids the navigation error
+            st.page_link(
+                model["page"],
+                label=f"Run {model['acronym']} Analysis →",
+                icon="🚀",
+                use_container_width=True,
+            )
+            st.markdown(
+                "<div class='small-tag'>Available</div>",
+                unsafe_allow_html=True,
+            )
+        else:
+            st.button(
+                f"{model['acronym']} – Coming soon",
+                disabled=True,
+                use_container_width=True,
+            )
+            st.markdown(
+                "<div class='small-tag'>Not implemented yet</div>",
+                unsafe_allow_html=True,
+            )
 
         st.markdown("</div>", unsafe_allow_html=True)
 
-st.markdown("---")
+st.write("")
+st.write("---")
 
-# ---------- COMPREHENSIVE ANALYSIS ----------
-st.subheader("Comprehensive Analysis (All Models)")
-
-st.write(
-    "Run all five models together to generate an integrated hydrological assessment. "
-    "This button will later call HSR, FCI, PEC, UDS, and SEI in sequence once all "
-    "models are implemented."
+# -------------------------------------------------------------------
+# Comprehensive analysis section (placeholder for now)
+# -------------------------------------------------------------------
+st.subheader("Comprehensive Analysis (all models)")
+st.info(
+    "This section will eventually run **HSR, FCI, PEC, UDS, and SEI** together and "
+    "produce an integrated parcel-level hydrological risk summary.\n\n"
+    "For now, only the **Flow Corridor Importance (FCI)** model is available "
+    "via the card above or the FCI page in the left sidebar."
 )
 
-if st.button("🚀 Run All Models (coming soon)"):
-    st.info(
-        "Comprehensive analysis is not yet implemented. Once HSR/PEC/UDS/SEI models "
-        "are coded in `models/`, this will run them all and merge outputs."
-    )
+st.button("Run All Models (coming soon)", disabled=True, use_container_width=True)
 
-# ---------- QUICK INFO ----------
-st.markdown("### Quick Stats")
-c1, c2, c3 = st.columns(3)
-with c1:
-    st.markdown(
-        """
-        <div class="metric-card">
-          <div style="font-size:28px;font-weight:700;color:#2563eb;">5</div>
-          <div style="color:#4b5563;">Analysis Models</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-with c2:
-    st.markdown(
-        """
-        <div class="metric-card">
-          <div style="font-size:24px;font-weight:700;color:#16a34a;">Scalable</div>
-          <div style="color:#4b5563;">Streamlit-based processing</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-with c3:
-    st.markdown(
-        """
-        <div class="metric-card">
-          <div style="font-size:24px;font-weight:700;color:#7c3aed;">Modular</div>
-          <div style="color:#4b5563;">Plug-in model architecture</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-st.markdown("---")
-st.caption("© 2024 Hydrological Analysis Platform · Built with Streamlit")
-
+st.write("")
+st.caption("Tip: You can also open the FCI page from the left sidebar navigation.")
