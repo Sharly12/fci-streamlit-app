@@ -6,8 +6,7 @@ fiona
 pyproj
 rasterstats
 pysheds
-numpy
-requests
 folium
-matplotlib
 streamlit-folium
+requests
+matplotlib
