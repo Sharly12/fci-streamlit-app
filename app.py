@@ -36,7 +36,7 @@ st.markdown(
 )
 
 # ---------- MODEL METADATA ----------
-# These paths must match files in your pages/ folder
+# IMPORTANT: page paths MUST match actual filenames in your `pages/` folder
 models_info = [
     {
         "id": "hsr",
@@ -101,7 +101,6 @@ cols = st.columns(3)
 for i, model in enumerate(models_info):
     col = cols[i % 3]
     with col:
-        # Card header + description
         st.markdown(
             f"""
             <div class="model-card">
@@ -119,11 +118,24 @@ for i, model in enumerate(models_info):
             unsafe_allow_html=True,
         )
 
-        # Navigation using page_link (no icon to avoid KeyError)
-        st.page_link(
-            model["page"],
-            label=f"Run {model['acronym']} Analysis",
-        )
+        btn_label = f"Run {model['acronym']} Analysis"
+        if st.button(btn_label, key=f"btn_{model['id']}"):
+            # Try to switch page programmatically
+            if hasattr(st, "switch_page"):
+                try:
+                    st.switch_page(model["page"])
+                except Exception as e:
+                    # Friendly fallback: don't crash the whole app
+                    st.error(
+                        "Navigation failed. "
+                        "Please open the page from the left sidebar.\n\n"
+                        f"Details: {e}"
+                    )
+            else:
+                st.info(
+                    "This Streamlit version does not support `st.switch_page`.\n\n"
+                    "Please use the left sidebar to select the page instead."
+                )
 
         st.markdown("</div>", unsafe_allow_html=True)
 
@@ -180,3 +192,4 @@ with c3:
 
 st.markdown("---")
 st.caption("© 2024 Hydrological Analysis Platform · Built with Streamlit")
+
