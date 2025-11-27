@@ -9,4 +9,5 @@ pysheds
 numpy
 requests
 folium
+matplotlib
 streamlit-folium
