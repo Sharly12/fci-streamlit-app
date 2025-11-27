@@ -112,8 +112,8 @@ models_info = [
         "name": "Surrounding Exposure Index",
         "emoji": "📍",
         "description": "Quantifies exposure levels based on surrounding environmental factors.",
-        "implemented": False,
-        "page": None,
+        "implemented": True,
+        "page": "pages/5_SEI_Analysis.py",
     },
 ]
 
@@ -192,3 +192,4 @@ st.button("Run All Models (coming soon)", disabled=True, use_container_width=Tru
 
 st.write("")
 st.caption("Tip: You can also open the FCI page from the left sidebar navigation.")
+
