@@ -36,7 +36,7 @@ st.markdown(
 )
 
 # ---------- MODEL METADATA ----------
-# IMPORTANT: these paths must match files in your pages/ folder
+# These paths must match files in your pages/ folder
 models_info = [
     {
         "id": "hsr",
@@ -119,11 +119,10 @@ for i, model in enumerate(models_info):
             unsafe_allow_html=True,
         )
 
-        # Navigation using page_link (no switch_page, no error)
+        # Navigation using page_link (no icon to avoid KeyError)
         st.page_link(
             model["page"],
             label=f"Run {model['acronym']} Analysis",
-            icon="➡️",
         )
 
         st.markdown("</div>", unsafe_allow_html=True)
