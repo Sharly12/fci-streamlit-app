@@ -1,4 +1,4 @@
-# pages/2_📈_FCI_Analysis.py
+# pages/2_FCI_Analysis.py
 import streamlit as st
 import pandas as pd
 from utils.data_loader import get_data_paths, load_base_data
@@ -105,3 +105,4 @@ if st.button("Run FCI Analysis"):
     )
 else:
     st.info("Set rainfall and click **Run FCI Analysis** to start.")
+
