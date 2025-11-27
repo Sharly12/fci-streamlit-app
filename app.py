@@ -1,14 +1,13 @@
-
-# app.py
 import streamlit as st
 
-# Optional: set once here for the whole app
+# ---------- GLOBAL CONFIG ----------
 st.set_page_config(
     page_title="Hydrological Analysis Platform",
     page_icon="💧",
     layout="wide",
 )
 
+# ---------- STYLES ----------
 st.markdown(
     """
     <style>
@@ -36,6 +35,8 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+# ---------- MODEL METADATA ----------
+# IMPORTANT: page paths MUST match actual filenames in your `pages/` folder
 models_info = [
     {
         "id": "hsr",
@@ -43,7 +44,7 @@ models_info = [
         "acronym": "HSR",
         "emoji": "💧",
         "description": "Analyzes water storage capacity and retention patterns across the landscape.",
-        "page": "pages/1_💧_HSR_Analysis.py",
+        "page": "pages/1_HSR_Analysis.py",
     },
     {
         "id": "fci",
@@ -51,7 +52,7 @@ models_info = [
         "acronym": "FCI",
         "emoji": "📈",
         "description": "Evaluates the significance of water flow pathways and corridor connectivity.",
-        "page": "pages/2_📈_FCI_Analysis.py",
+        "page": "pages/2_FCI_Analysis.py",
     },
     {
         "id": "pec",
@@ -59,7 +60,7 @@ models_info = [
         "acronym": "PEC",
         "emoji": "⛰️",
         "description": "Assesses elevation-based risk factors and topographical context for each parcel.",
-        "page": "pages/3_⛰️_PEC_Analysis.py",
+        "page": "pages/3_PEC_Analysis.py",
     },
     {
         "id": "uds",
@@ -67,7 +68,7 @@ models_info = [
         "acronym": "UDS",
         "emoji": "🔁",
         "description": "Measures the interdependence between upstream and downstream areas.",
-        "page": "pages/4_🔁_UDS_Analysis.py",
+        "page": "pages/4_UDS_Analysis.py",
     },
     {
         "id": "sei",
@@ -75,7 +76,7 @@ models_info = [
         "acronym": "SEI",
         "emoji": "📍",
         "description": "Quantifies exposure levels based on surrounding environmental factors.",
-        "page": "pages/5_📍_SEI_Analysis.py",
+        "page": "pages/5_SEI_Analysis.py",
     },
 ]
 
@@ -119,13 +120,21 @@ for i, model in enumerate(models_info):
 
         btn_label = f"Run {model['acronym']} Analysis"
         if st.button(btn_label, key=f"btn_{model['id']}"):
-            # Switch to the dedicated page for this model (Streamlit >= 1.22)
+            # Try to switch page programmatically
             if hasattr(st, "switch_page"):
-                st.switch_page(model["page"])
+                try:
+                    st.switch_page(model["page"])
+                except Exception as e:
+                    # Friendly fallback: don't crash the whole app
+                    st.error(
+                        "Navigation failed. "
+                        "Please open the page from the left sidebar.\n\n"
+                        f"Details: {e}"
+                    )
             else:
-                st.warning(
-                    "Use the left sidebar to open the "
-                    f"**{model['acronym']}_Analysis** page."
+                st.info(
+                    "This Streamlit version does not support `st.switch_page`.\n\n"
+                    "Please use the left sidebar to select the page instead."
                 )
 
         st.markdown("</div>", unsafe_allow_html=True)
@@ -137,13 +146,14 @@ st.subheader("Comprehensive Analysis (All Models)")
 
 st.write(
     "Run all five models together to generate an integrated hydrological assessment. "
-    "This will eventually call HSR, FCI, PEC, UDS, and SEI in sequence and combine their outputs."
+    "This button will later call HSR, FCI, PEC, UDS, and SEI in sequence once all "
+    "models are implemented."
 )
 
 if st.button("🚀 Run All Models (coming soon)"):
     st.info(
-        "Placeholder: Comprehensive analysis will call all 5 model functions once "
-        "HSR/PEC/UDS/SEI are implemented in `models/`."
+        "Comprehensive analysis is not yet implemented. Once HSR/PEC/UDS/SEI models "
+        "are coded in `models/`, this will run them all and merge outputs."
     )
 
 # ---------- QUICK INFO ----------
