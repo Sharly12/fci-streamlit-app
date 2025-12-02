@@ -10,7 +10,9 @@ st.title("📈 Flow Corridor Importance (FCI) Analysis")
 
 st.write(
     "This page runs the full Flow Corridor Importance model: "
-    "NRCS runoff → D8 flow accumulation → flow corridors → parcel-level FCI."
+    "NRCS runoff → D8 flow accumulation → flow corridors → parcel-level indices.\n\n"
+    "- **FCI_struct** = structural importance (0–1) based on flow network and corridors.\n"
+    "- **FCI** = rainfall-scaled FCI = FCI_struct × (Rainfall / 250 mm), used for risk."
 )
 
 # --- User controls ---
@@ -57,7 +59,7 @@ if st.button("Run FCI Analysis"):
         st.write(f"- Corridor cells: **{corridor_cells:,}**")
 
     # Risk distribution
-    st.subheader("Parcel Risk Distribution")
+    st.subheader("Parcel Risk Distribution (based on rainfall-scaled FCI)")
     risk_df = pd.DataFrame(
         [
             {"Risk": lbl, "Parcels": cnt, "Percent": cnt / len(parcels_result) * 100.0}
@@ -78,9 +80,10 @@ if st.button("Run FCI Analysis"):
     folium_static(fci_map, width=1000, height=600)
 
     # Top parcels + CSV
-    st.subheader("Top 10 High-FCI Parcels")
+    st.subheader("Top 10 High-Risk Parcels")
     cols = [
-        "FCI",
+        "FCI",          # rainfall-scaled
+        "FCI_struct",   # structural component
         "FCI_class_10",
         "Risk",
         "fci_sum",
@@ -88,11 +91,17 @@ if st.button("Run FCI Analysis"):
         "fci_p90",
         "Rainfall_mm",
     ]
-    table_df = parcels_result.sort_values("FCI", ascending=False)[cols]
+    existing_cols = [c for c in cols if c in parcels_result.columns]
+    table_df = parcels_result.sort_values("FCI", ascending=False)[existing_cols]
     st.dataframe(
         table_df.head(10).style.format(
-            {"FCI": "{:.3f}", "fci_sum": "{:.0f}",
-             "fci_corr_sum": "{:.0f}", "fci_p90": "{:.0f}"}
+            {
+                "FCI": "{:.3f}",
+                "FCI_struct": "{:.3f}",
+                "fci_sum": "{:.0f}",
+                "fci_corr_sum": "{:.0f}",
+                "fci_p90": "{:.0f}",
+            }
         )
     )
 
@@ -105,4 +114,3 @@ if st.button("Run FCI Analysis"):
     )
 else:
     st.info("Set rainfall and click **Run FCI Analysis** to start.")
-
