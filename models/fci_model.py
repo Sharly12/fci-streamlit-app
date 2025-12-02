@@ -1,67 +1,107 @@
 # models/fci_model.py
+
 import numpy as np
+import pandas as pd
 from collections import deque
 from rasterstats import zonal_stats
-import streamlit as st
 
-ACCUM_Q = 0.90
+# ------------------------------
+# Configuration
+# ------------------------------
+ACCUM_Q = 0.90        # quantile for identifying flow corridors (top 10%)
 EPS = 1e-9
 
-WEIGHT_SUM      = 0.4
-WEIGHT_CORRIDOR = 0.4
-WEIGHT_P90      = 0.2
+# Component weights for structural FCI
+WEIGHT_SUM = 0.4        # contribution from total accumulation
+WEIGHT_CORRIDOR = 0.4   # contribution from corridor accumulation
+WEIGHT_P90 = 0.2        # contribution from peak flow (P90)
 
-FCI_LOW_THRESHOLD  = 0.33
-FCI_HIGH_THRESHOLD = 0.66
+# Maximum rainfall used for scaling (should match your slider max)
+RAIN_MAX_FOR_SCALING = 250.0  # mm
 
 
+# ------------------------------
+# Helper functions
+# ------------------------------
 def nrcs_runoff_depth(P_mm, CN):
+    """
+    NRCS/SCS Curve Number runoff depth (mm).
+    P_mm : scalar rainfall depth in mm
+    CN   : 2D array of curve numbers
+    """
     CN = np.clip(CN, 1.0, 100.0).astype("float32")
-    S = (25400.0 / CN) - 254.0
-    Ia = 0.2 * S
-    Pe = np.where(P_mm > Ia, ((P_mm - Ia) ** 2) / (P_mm - Ia + S), 0.0)
+    S = (25400.0 / CN) - 254.0      # mm
+    Ia = 0.2 * S                    # initial abstraction
+
+    # Broadcast P_mm over the grid
+    P = np.asarray(P_mm, dtype="float32")
+    Pe = np.where(
+        P > Ia,
+        ((P - Ia) ** 2) / (P - Ia + S + EPS),
+        0.0,
+    )
     return Pe.astype("float32")
 
 
-def normalize_minmax(x):
+def normalize_minmax(x, eps=EPS):
+    """
+    Min-max normalization with safety:
+    returns 0 if array is constant or empty.
+    """
     x = np.asarray(x, dtype="float64")
-    x_min, x_max = np.nanmin(x), np.nanmax(x)
-    if x_max - x_min < EPS:
-        return np.zeros_like(x)
-    return (x - x_min) / (x_max - x_min)
+    if x.size == 0:
+        return x
+    x_min = np.nanmin(x)
+    x_max = np.nanmax(x)
+    rng = max(x_max - x_min, eps)
+    return (x - x_min) / rng
 
 
 def safe_get(stats_dict, key, default=np.nan):
+    """Safely extract value from a zonal_stats result (dict)."""
     if isinstance(stats_dict, dict):
         return stats_dict.get(key, default)
     return default
 
 
 def detect_pysheds_flow_direction_scheme(fdir_array):
+    """
+    Detect which flow direction encoding scheme pysheds is using.
+    Returns: (scheme_name, direction_map)
+    """
     unique_vals = np.unique(fdir_array[fdir_array > 0])
     unique_vals = unique_vals[~np.isnan(unique_vals)]
 
-    st.write("🔍 Flow Direction Analysis:")
-    st.write(f"&nbsp;&nbsp;Unique flow direction values: {unique_vals}")
-
+    # Power-of-2 (classic D8)
     power_of_2_values = {1, 2, 4, 8, 16, 32, 64, 128}
     if set(unique_vals).issubset(power_of_2_values):
-        st.write("&nbsp;&nbsp;✓ Detected: Power-of-2 encoding (D8 standard)")
         direction_map = {
-            1: (0, 1), 2: (1, 1), 4: (1, 0), 8: (1, -1),
-            16: (0, -1), 32: (-1, -1), 64: (-1, 0), 128: (-1, 1),
+            1:   (0, 1),    # E
+            2:   (1, 1),    # SE
+            4:   (1, 0),    # S
+            8:   (1, -1),   # SW
+            16:  (0, -1),   # W
+            32:  (-1, -1),  # NW
+            64:  (-1, 0),   # N
+            128: (-1, 1),   # NE
         }
         return "power_of_2", direction_map
 
+    # Sequential 0–7 encoding
     if set(unique_vals).issubset(set(range(8))):
-        st.write("&nbsp;&nbsp;✓ Detected: Sequential 0–7 encoding")
         direction_map = {
-            0: (0, 1), 1: (1, 1), 2: (1, 0), 3: (1, -1),
-            4: (0, -1), 5: (-1, -1), 6: (-1, 0), 7: (-1, 1),
+            0: (0, 1),     # E
+            1: (1, 1),     # SE
+            2: (1, 0),     # S
+            3: (1, -1),    # SW
+            4: (0, -1),    # W
+            5: (-1, -1),   # NW
+            6: (-1, 0),    # N
+            7: (-1, 1),    # NE
         }
         return "sequential_0_7", direction_map
 
-    st.write("⚠️ WARNING: Unknown flow direction encoding – assuming power-of-2.")
+    # Fallback
     direction_map = {
         1: (0, 1), 2: (1, 1), 4: (1, 0), 8: (1, -1),
         16: (0, -1), 32: (-1, -1), 64: (-1, 0), 128: (-1, 1),
@@ -70,9 +110,20 @@ def detect_pysheds_flow_direction_scheme(fdir_array):
 
 
 def accumulate_d8_validated(fdir, weights, valid_mask):
+    """
+    Enhanced D8 flow accumulation with validation and diagnostics.
+    fdir        : 2D array of flow directions (pysheds)
+    weights     : 2D array of runoff weights (mm or unit flow)
+    valid_mask  : 2D boolean array of valid cells
+
+    Returns:
+      accumulation : 2D array
+      diagnostics  : dict with mass-balance checks, etc.
+    """
     H, W = fdir.shape
     N = H * W
 
+    # Detect encoding
     scheme, direction_map = detect_pysheds_flow_direction_scheme(fdir)
 
     fdir = fdir.astype(np.int32, copy=False)
@@ -81,44 +132,43 @@ def accumulate_d8_validated(fdir, weights, valid_mask):
     def coords_to_index(r, c):
         return r * W + c
 
+    # Build downstream connectivity
     downstream = np.full(N, -1, dtype=np.int64)
     valid_flat = valid_mask.ravel()
 
-    for direction_code, (dr, dc) in direction_map.items():
-        flow_mask = (fdir == direction_code) & valid_mask
+    for code, (dr, dc) in direction_map.items():
+        flow_mask = (fdir == code) & valid_mask
         if not flow_mask.any():
             continue
 
-        source_rows, source_cols = np.nonzero(flow_mask)
-        dest_rows = source_rows + dr
-        dest_cols = source_cols + dc
+        src_r, src_c = np.nonzero(flow_mask)
+        dst_r = src_r + dr
+        dst_c = src_c + dc
 
-        valid_destinations = (
-            (dest_rows >= 0) & (dest_rows < H) &
-            (dest_cols >= 0) & (dest_cols < W) &
-            valid_mask[dest_rows, dest_cols]
+        in_bounds = (
+            (dst_r >= 0) & (dst_r < H) &
+            (dst_c >= 0) & (dst_c < W) &
+            valid_mask[dst_r, dst_c]
         )
-        if not valid_destinations.any():
+        if not in_bounds.any():
             continue
 
-        source_indices = coords_to_index(
-            source_rows[valid_destinations],
-            source_cols[valid_destinations],
-        )
-        dest_indices = coords_to_index(
-            dest_rows[valid_destinations],
-            dest_cols[valid_destinations],
-        )
-        downstream[source_indices] = dest_indices
+        src_idx = coords_to_index(src_r[in_bounds], src_c[in_bounds])
+        dst_idx = coords_to_index(dst_r[in_bounds], dst_c[in_bounds])
+        downstream[src_idx] = dst_idx
 
+    # Incoming degree
     incoming_degree = np.zeros(N, dtype=np.int32)
     has_downstream = downstream >= 0
     np.add.at(incoming_degree, downstream[has_downstream], 1)
 
     accumulation = weights.ravel().copy()
+
+    # Outlets: valid cells with no downstream
     outlets = valid_flat & (downstream == -1)
     num_outlets = int(np.sum(outlets))
 
+    # Topological traversal
     queue = deque(list(np.nonzero((incoming_degree == 0) & valid_flat)[0]))
     processed = np.zeros(N, dtype=bool)
     processed[list(queue)] = True
@@ -127,30 +177,32 @@ def accumulate_d8_validated(fdir, weights, valid_mask):
     max_iterations = N * 2
 
     while queue and iterations < max_iterations:
-        current_cell = queue.popleft()
-        downstream_cell = downstream[current_cell]
+        current = queue.popleft()
+        dst = downstream[current]
 
-        if downstream_cell >= 0:
-            accumulation[downstream_cell] += accumulation[current_cell]
-            incoming_degree[downstream_cell] -= 1
+        if dst >= 0:
+            accumulation[dst] += accumulation[current]
+            incoming_degree[dst] -= 1
 
-            if (incoming_degree[downstream_cell] == 0 and
-                valid_flat[downstream_cell] and
-                not processed[downstream_cell]):
-                processed[downstream_cell] = True
-                queue.append(downstream_cell)
+            if (incoming_degree[dst] == 0 and
+                valid_flat[dst] and
+                not processed[dst]):
+                processed[dst] = True
+                queue.append(dst)
 
         iterations += 1
 
+    # Diagnostics
     unprocessed = valid_flat & ~processed
     num_unprocessed = int(np.sum(unprocessed))
 
     total_input = float(np.sum(weights[valid_mask]))
     total_accumulated = float(np.sum(accumulation.reshape(H, W)[valid_mask]))
     outlet_accumulation = float(np.sum(accumulation[outlets]))
+
     mass_balance_error = (
-        abs(total_accumulated - total_input) /
-        (total_input + EPS) * 100.0
+        abs(total_accumulated - total_input) / (total_input + EPS) * 100.0
+        if total_input > 0 else 0.0
     )
 
     diagnostics = {
@@ -160,70 +212,94 @@ def accumulate_d8_validated(fdir, weights, valid_mask):
         "outlet_accumulation": outlet_accumulation,
         "num_outlets": num_outlets,
         "num_unprocessed": num_unprocessed,
-        "mass_balance_error_pct": float(mass_balance_error),
-        "iterations": int(iterations),
+        "mass_balance_error_pct": mass_balance_error,
+        "iterations": iterations,
     }
 
     return accumulation.reshape(H, W), diagnostics
 
 
+# ------------------------------
+# Main FCI analysis
+# ------------------------------
 def run_fci_analysis(rainfall_mm, use_nrcs_runoff, base_data):
     """
-    Full hydrologic + FCI analysis for one rainfall scenario.
+    Run Flow Corridor Importance (FCI) analysis for a given rainfall.
 
-    Returns:
-      parcels_result, diagnostics, corridor_threshold, corridor_cells,
-      risk_counts, flow_accumulation, corridor_mask
+    Parameters
+    ----------
+    rainfall_mm : float
+        Design rainfall (mm).
+    use_nrcs_runoff : bool
+        If True, use NRCS SCS CN runoff; else simple CN scaling.
+    base_data : dict
+        Output of utils.data_loader.load_base_data, with keys:
+        - dem, valid_mask, flow_directions, cn_aligned,
+          dem_profile, dem_transform, dem_crs,
+          height, width, parcels (GeoDataFrame)
+
+    Returns
+    -------
+    parcels : GeoDataFrame
+        Parcels with FCI, FCI_struct, risk classes, zonal stats.
+    diagnostics : dict
+        Flow accumulation diagnostics.
+    corridor_threshold : float
+        Accumulation threshold used to define corridors.
+    corridor_cells : int
+        Number of corridor cells.
+    risk_counts : dict
+        Counts of parcels in each risk class.
+    flow_accumulation : 2D np.ndarray
+        Flow accumulation grid.
+    corridor_mask : 2D np.ndarray (uint8)
+        1 where corridors, 0 otherwise.
     """
     dem = base_data["dem"]
     valid_mask = base_data["valid_mask"]
     flow_directions = base_data["flow_directions"]
     cn_aligned = base_data["cn_aligned"]
+    dem_profile = base_data["dem_profile"]
     dem_transform = base_data["dem_transform"]
+    dem_crs = base_data["dem_crs"]
+    height = base_data["height"]
+    width = base_data["width"]
     parcels = base_data["parcels"].copy()
 
-    # --- Runoff weights ---
-    if rainfall_mm <= 0:
-        runoff_weights = np.zeros_like(cn_aligned, dtype="float32")
-        st.warning("Rainfall is 0 mm – all runoff and FCI scores will be 0.")
+    # --------------------------
+    # 1) Runoff weights
+    # --------------------------
+    if use_nrcs_runoff:
+        runoff_weights = nrcs_runoff_depth(rainfall_mm, cn_aligned)
     else:
-        if use_nrcs_runoff:
-            runoff_weights = nrcs_runoff_depth(rainfall_mm, cn_aligned)
-        else:
-            runoff_weights = (rainfall_mm * (cn_aligned / 100.0)).astype("float32")
+        runoff_weights = (rainfall_mm * (cn_aligned / 100.0)).astype("float32")
 
     runoff_weights = np.where(valid_mask, np.nan_to_num(runoff_weights, nan=0.0), 0.0)
     runoff_weights = np.maximum(runoff_weights, 0.0).astype("float32")
 
-    positive_runoff = runoff_weights[runoff_weights > 0]
-    if positive_runoff.size > 0:
-        st.write(
-            f"💧 Runoff range (valid cells): {np.min(positive_runoff):.2f} – "
-            f"{np.max(runoff_weights):.2f} mm"
-        )
-    else:
-        st.write("💧 No positive runoff values (all zeros).")
-
-    # --- Flow accumulation ---
-    st.write("🌊 Computing D8 flow accumulation ...")
+    # --------------------------
+    # 2) Flow accumulation
+    # --------------------------
     flow_accumulation, diagnostics = accumulate_d8_validated(
         flow_directions, runoff_weights, valid_mask
     )
 
-    # --- Corridors ---
-    positive_accumulation = flow_accumulation[flow_accumulation > 0]
-    if positive_accumulation.size > 0:
-        corridor_threshold = float(np.quantile(positive_accumulation, ACCUM_Q))
+    # --------------------------
+    # 3) Flow corridors (still relative, top 10%)
+    # --------------------------
+    positive = flow_accumulation[flow_accumulation > 0]
+    if positive.size > 0:
+        corridor_threshold = float(np.quantile(positive, ACCUM_Q))
     else:
         corridor_threshold = float("inf")
 
     corridor_mask = (flow_accumulation >= corridor_threshold).astype("uint8")
     corridor_cells = int(np.sum(corridor_mask))
-    corridor_accumulation = flow_accumulation * corridor_mask
 
-    # --- Zonal statistics ---
-    st.write("📈 Calculating parcel-level zonal statistics ...")
-
+    # --------------------------
+    # 4) Zonal statistics per parcel
+    # --------------------------
+    # All accumulation
     zonal_all = zonal_stats(
         vectors=parcels.geometry,
         raster=flow_accumulation,
@@ -233,6 +309,8 @@ def run_fci_analysis(rainfall_mm, use_nrcs_runoff, base_data):
         all_touched=False,
     )
 
+    # Corridor-only accumulation
+    corridor_accumulation = flow_accumulation * corridor_mask
     zonal_corridor = zonal_stats(
         vectors=parcels.geometry,
         raster=corridor_accumulation,
@@ -242,6 +320,7 @@ def run_fci_analysis(rainfall_mm, use_nrcs_runoff, base_data):
         all_touched=False,
     )
 
+    # 90th percentile of accumulation
     zonal_p90_raw = zonal_stats(
         vectors=parcels.geometry,
         raster=flow_accumulation,
@@ -251,53 +330,74 @@ def run_fci_analysis(rainfall_mm, use_nrcs_runoff, base_data):
         all_touched=False,
     )
 
-    fci_count_cells = np.array([safe_get(z, "count", 0) for z in zonal_all], dtype="float64")
-    fci_sum         = np.array([safe_get(z, "sum", 0.0)   for z in zonal_all], dtype="float64")
-    fci_mean        = np.array([safe_get(z, "mean", 0.0)  for z in zonal_all], dtype="float64")
-    fci_max         = np.array([safe_get(z, "max", 0.0)   for z in zonal_all], dtype="float64")
-    fci_p90         = np.array([safe_get(z, "percentile_90", 0.0) for z in zonal_p90_raw],
-                               dtype="float64")
-    fci_corr_sum    = np.array([safe_get(z, "sum", 0.0)   for z in zonal_corridor],
-                               dtype="float64")
-    fci_corr_mean   = np.array([safe_get(z, "mean", 0.0)  for z in zonal_corridor],
-                               dtype="float64")
-    fci_corr_max    = np.array([safe_get(z, "max", 0.0)   for z in zonal_corridor],
-                               dtype="float64")
+    # Attach zonal stats
+    parcels["fci_count_cells"] = [safe_get(z, "count", 0) for z in zonal_all]
+    parcels["fci_sum"] = [safe_get(z, "sum", 0.0) for z in zonal_all]
+    parcels["fci_mean"] = [safe_get(z, "mean", 0.0) for z in zonal_all]
+    parcels["fci_max"] = [safe_get(z, "max", 0.0) for z in zonal_all]
+    parcels["fci_p90"] = [safe_get(z, "percentile_90", 0.0) for z in zonal_p90_raw]
 
-    parcels["fci_count"]     = fci_count_cells
-    parcels["fci_sum"]       = fci_sum
-    parcels["fci_mean"]      = fci_mean
-    parcels["fci_max"]       = fci_max
-    parcels["fci_p90"]       = fci_p90
-    parcels["fci_corr_sum"]  = fci_corr_sum
-    parcels["fci_corr_mean"] = fci_corr_mean
-    parcels["fci_corr_max"]  = fci_corr_max
+    parcels["fci_corr_sum"] = [safe_get(z, "sum", 0.0) for z in zonal_corridor]
+    parcels["fci_corr_mean"] = [safe_get(z, "mean", 0.0) for z in zonal_corridor]
+    parcels["fci_corr_max"] = [safe_get(z, "max", 0.0) for z in zonal_corridor]
 
-    parcels["fci_sum_norm"]      = normalize_minmax(parcels["fci_sum"].values)
+    # --------------------------
+    # 5) Structural FCI (0–1, rainfall-independent)
+    # --------------------------
+    parcels["fci_sum_norm"] = normalize_minmax(parcels["fci_sum"].values)
     parcels["fci_corr_sum_norm"] = normalize_minmax(parcels["fci_corr_sum"].values)
-    parcels["fci_p90_norm"]      = normalize_minmax(parcels["fci_p90"].values)
+    parcels["fci_p90_norm"] = normalize_minmax(parcels["fci_p90"].values)
 
-    parcels["FCI"] = (
-        WEIGHT_SUM      * parcels["fci_sum_norm"] +
-        WEIGHT_CORRIDOR * parcels["fci_corr_sum_norm"] +
-        WEIGHT_P90      * parcels["fci_p90_norm"]
+    parcels["FCI_struct"] = (
+        WEIGHT_SUM * parcels["fci_sum_norm"]
+        + WEIGHT_CORRIDOR * parcels["fci_corr_sum_norm"]
+        + WEIGHT_P90 * parcels["fci_p90_norm"]
     )
-    parcels["FCI"] = parcels["FCI"].clip(0.0, 1.0)
-    parcels["Rainfall_mm"] = rainfall_mm
 
-    fci_class = np.floor(parcels["FCI"].values * 10).astype(int) + 1
-    fci_class = np.clip(fci_class, 1, 10)
-    parcels["FCI_class_10"] = fci_class
+    # --------------------------
+    # 6) Rainfall scaling – new FCI
+    # --------------------------
+    if RAIN_MAX_FOR_SCALING > 0:
+        P_norm = float(
+            np.clip(rainfall_mm / float(RAIN_MAX_FOR_SCALING), 0.0, 1.0)
+        )
+    else:
+        P_norm = 0.0
 
-    risk = np.full(len(parcels), "Low", dtype=object)
-    risk[parcels["FCI"] >= FCI_HIGH_THRESHOLD] = "High"
-    medium_mask = ((parcels["FCI"] >= FCI_LOW_THRESHOLD) &
-                   (parcels["FCI"] < FCI_HIGH_THRESHOLD))
-    risk[medium_mask] = "Medium"
-    parcels["Risk"] = risk
+    parcels["Rainfall_mm"] = float(rainfall_mm)
+    parcels["P_norm"] = P_norm  # useful for debugging / plotting
 
-    labels, counts = np.unique(risk, return_counts=True)
-    risk_counts = dict(zip(labels, counts))
+    # NEW rainfall-scaled FCI used for risk & maps
+    parcels["FCI"] = parcels["FCI_struct"] * P_norm
+
+    # --------------------------
+    # 7) Risk classification on scaled FCI
+    # --------------------------
+    # 10-class FCI for detailed mapping
+    if parcels["FCI"].max() > 0:
+        bins_10 = np.linspace(0.0, 1.0, 11)
+        labels_10 = [str(i) for i in range(1, 11)]
+        parcels["FCI_class_10"] = pd.cut(
+            parcels["FCI"],
+            bins=bins_10,
+            labels=labels_10,
+            include_lowest=True,
+        )
+    else:
+        # All effectively zero: treat as lowest class
+        parcels["FCI_class_10"] = "1"
+
+    # 3-class risk (you can tune these thresholds)
+    risk_bins = [0.0, 0.2, 0.5, 1.0]
+    risk_labels = ["Low", "Medium", "High"]
+    parcels["Risk"] = pd.cut(
+        parcels["FCI"],
+        bins=risk_bins,
+        labels=risk_labels,
+        include_lowest=True,
+    )
+
+    risk_counts = parcels["Risk"].value_counts().to_dict()
 
     return (
         parcels,
