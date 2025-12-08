@@ -1,4 +1,4 @@
-# pages/1_💧_HSR_Analysis.py
+# pages/1_HSR_Analysis.py
 
 import streamlit as st
 from streamlit_folium import folium_static
@@ -54,36 +54,60 @@ if run_btn:
 
     st.success("✅ HSR analysis complete")
 
-    # Diagnostics
+    # ---- Safely extract diagnostic values (with fallbacks) ----
+    rain_val = diagnostics.get("rainfall_mm", rainfall_mm)
+    cell_size = diagnostics.get("cell_size_m", 30.0)
+    conc_win = diagnostics.get("concavity_window", concavity_window)
+
+    depth_thr = diagnostics.get(
+        "depth_threshold_m",
+        diagnostics.get("depth_threshold", 0.0),
+    )
+
+    num_patches = diagnostics.get("num_patches", len(parcels_hsr))
+
+    total_static = diagnostics.get(
+        "total_static_storage",
+        float(parcels_hsr.get("HSR_static_sum", 0).sum()),
+    )
+    total_rain = diagnostics.get(
+        "total_rain_filled",
+        float(parcels_hsr.get("HSR_rain_sum", 0).sum()),
+    )
+
+    # ------------------------------------------------------------------
+    # Diagnostics panel
+    # ------------------------------------------------------------------
     st.subheader("Hydrological Storage Diagnostics")
     c1, c2, c3 = st.columns(3)
 
     with c1:
-        st.metric("Rainfall (mm)", f"{diagnostics['rainfall_mm']:.1f}")
-        st.metric("Cell size (m)", f"{diagnostics['cell_size_m']:.1f}")
+        st.metric("Rainfall (mm)", f"{rain_val:.1f}")
+        st.metric("Cell size (m)", f"{cell_size:.1f}")
 
     with c2:
-        st.metric("Concavity window (cells)", diagnostics["concavity_window"])
-        st.metric("Depth threshold (m)", f"{diagnostics['depth_threshold_m']:.3f}")
+        st.metric("Concavity window (cells)", conc_win)
+        st.metric("Depth threshold (m)", f"{depth_thr:.3f}")
 
     with c3:
-        st.metric("Storage patches", diagnostics["num_patches"])
-        st.metric(
-            "Total storage (m³)",
-            f"{diagnostics['total_static_storage']:.0f}",
-        )
+        st.metric("Storage patches", num_patches)
+        st.metric("Total storage (m³)", f"{total_static:.0f}")
 
     st.metric(
         "Total rainfall-filled storage (m³)",
-        f"{diagnostics['total_rain_filled']:.0f}",
+        f"{total_rain:.0f}",
     )
 
+    # ------------------------------------------------------------------
     # Map
+    # ------------------------------------------------------------------
     st.subheader("Interactive HSR Map")
-    hsr_map = build_hsr_map(parcels_hsr, rainfall_mm)
+    hsr_map = build_hsr_map(parcels_hsr, rain_val)
     folium_static(hsr_map, width=1000, height=600)
 
+    # ------------------------------------------------------------------
     # Table
+    # ------------------------------------------------------------------
     st.subheader("Top 10 parcels by rainfall-filled storage")
     cols = [
         "HSR_rain_sum",
