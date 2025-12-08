@@ -1,112 +1,148 @@
 # models/hsr_model.py
-# ============================================================
-# HSR ENGINE – Web-app version
-# - Uses preloaded DEM/CN/parcels from utils.data_loader.load_base_data
-# - Computes:
-#     * HSR_static (m³) – pure concavity storage volume
-#     * HSR_rain   (m³) – rainfall-limited storage (SCS–CN runoff)
-# - Returns parcel-level stats + raster arrays for visualization
-# ============================================================
+# HSR ENGINE v4 – Concavity-based Storage for SRTM 30 m
+# - HSR_static: topographic storage volume (m³)
+# - HSR_rain: rainfall-adjusted storage volume (m³)
+# - Parcel-level zonal stats using shared parcels (GeoJSON)
 
 import numpy as np
-import pandas as pd
+import geopandas as gpd
+from pathlib import Path
+import tempfile
+
+import rasterio
+from rasterio.warp import reproject, Resampling, calculate_default_transform
 from pysheds.grid import Grid
 from scipy import ndimage
 from scipy.ndimage import grey_closing
 from rasterstats import zonal_stats
 
 
-# ---------- small helper ----------
+def _reproject_raster(src_path, dst_path, target_crs, res):
+    """Reproject a raster to target_crs at a given resolution."""
+    with rasterio.open(src_path) as src:
+        transform, w, h = calculate_default_transform(
+            src.crs,
+            target_crs,
+            src.width,
+            src.height,
+            *src.bounds,
+            resolution=res,
+        )
+        profile = src.profile.copy()
+        profile.update(
+            {
+                "crs": target_crs,
+                "transform": transform,
+                "width": w,
+                "height": h,
+                "compress": "lzw",
+            }
+        )
 
-def _normalize_minmax(arr, eps: float = 1e-9):
-    arr = np.asarray(arr, dtype="float64")
-    if arr.size == 0:
-        return arr
-    amin = np.nanmin(arr)
-    amax = np.nanmax(arr)
-    rng = max(amax - amin, eps)
-    return (arr - amin) / rng
+        is_int = np.issubdtype(src.dtypes[0], np.integer)
+        resampling = Resampling.nearest if is_int else Resampling.bilinear
+
+        dst_path = Path(dst_path)
+        dst_path.parent.mkdir(parents=True, exist_ok=True)
+
+        with rasterio.open(dst_path, "w", **profile) as dst:
+            for i in range(1, src.count + 1):
+                reproject(
+                    rasterio.band(src, i),
+                    rasterio.band(dst, i),
+                    src_transform=src.transform,
+                    src_crs=src.crs,
+                    dst_transform=transform,
+                    dst_crs=target_crs,
+                    resampling=resampling,
+                )
 
 
-# ---------- main engine ----------
+def _load_raster(path):
+    """Load a raster band as float64 array with NaNs for nodata."""
+    with rasterio.open(path) as src:
+        arr = src.read(1).astype("float64")
+        profile = src.profile
+        nodata = src.nodata
+        if nodata is not None:
+            arr = np.where(arr == nodata, np.nan, arr)
+    return arr, profile
+
 
 def run_hsr_analysis(
     rainfall_mm: float,
-    base_data: dict,
+    dem_path: str,
+    cn_path: str,
+    parcels_path: str,
+    target_resolution: float = 30.0,
     concavity_window: int = 7,
 ):
     """
-    Run HSR analysis using arrays from load_base_data.
+    Run the HSR engine and return:
+      - parcels_gdf with HSR columns
+      - diagnostics dict
 
     Parameters
     ----------
     rainfall_mm : float
-        Design storm depth (mm).
-    base_data : dict
-        Output from utils.data_loader.load_base_data(...).
+        Storm depth in mm.
+    dem_path : str
+        Path to DEM raster (same as used by FCI).
+    cn_path : str
+        Path to Curve Number raster.
+    parcels_path : str
+        Path to parcels vector (GeoJSON, Shapefile, etc.).
+    target_resolution : float
+        Target DEM/CN resolution in meters after reprojection.
     concavity_window : int
-        Size of morphological window (in cells) for concavity (e.g. 7 → 7x7).
-
-    Returns
-    -------
-    parcels : GeoDataFrame
-        Parcels with HSR attributes and 10-class HSR_rain classification.
-    diagnostics : dict
-        Summary stats and processing diagnostics.
-    HSR_static : 2D np.ndarray
-        Static storage volume per cell (m³).
-    HSR_rain_map : 2D np.ndarray
-        Rainfall-limited storage volume per cell (m³).
+        Window size (cells) for concavity detection (e.g., 7 for 7x7).
     """
-    # --------------------------------------------------------
-    # Unpack shared data
-    # --------------------------------------------------------
-    dem = base_data["dem"].astype("float64")
-    cn = base_data["cn_aligned"].astype("float64")
-    dem_profile = base_data["dem_profile"]
-    dem_transform = base_data["dem_transform"]
-    dem_crs = base_data["dem_crs"]
-    parcels = base_data["parcels"].copy()
-    dem_path = base_data["dem_path"]
 
-    cell_size = float(abs(dem_transform[0]))
+    # ============================================================
+    # STEP 1 — REPROJECT DEM & CN TO UTM
+    # ============================================================
+    with rasterio.open(dem_path) as dem_src:
+        bounds = dem_src.bounds
+        lon_center = (bounds.left + bounds.right) / 2.0
+        utm_zone = int((lon_center + 180) / 6) + 1
+        target_crs = f"EPSG:326{utm_zone}"
+
+    tmp_dir = Path(tempfile.gettempdir()) / "hsr_engine"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    dem_utm_path = tmp_dir / "dem_utm.tif"
+    cn_utm_path = tmp_dir / "cn_utm.tif"
+
+    _reproject_raster(dem_path, dem_utm_path, target_crs, target_resolution)
+    _reproject_raster(cn_path, cn_utm_path, target_crs, target_resolution)
+
+    dem, dem_profile = _load_raster(dem_utm_path)
+    cn, _ = _load_raster(cn_utm_path)
+
+    transform = dem_profile["transform"]
+    cell_size = transform[0]
     cell_area = cell_size * cell_size
 
-    diagnostics = {
-        "rainfall_mm": float(rainfall_mm),
-        "concavity_window": int(concavity_window),
-        "cell_size_m": cell_size,
-    }
-
-    # --------------------------------------------------------
-    # STEP 1 – Prepare grid for flow routing
-    # --------------------------------------------------------
-    grid = Grid.from_raster(dem_path, data_name="dem")
-    dem_raw = grid.read_raster(dem_path).astype("float64")
+    # ============================================================
+    # STEP 2 — FLOW-ROUTING DEM (for accumulation)
+    # ============================================================
+    grid = Grid.from_raster(str(dem_utm_path), data_name="dem")
+    dem_raw = grid.read_raster(str(dem_utm_path))
 
     dem_filled = grid.fill_depressions(dem_raw)
     dem_flat = grid.resolve_flats(dem_filled)
 
-    diagnostics["dem_min"] = float(np.nanmin(dem_raw))
-    diagnostics["dem_max"] = float(np.nanmax(dem_raw))
-
-    # --------------------------------------------------------
-    # STEP 2 – Concavity / storage depth (m)
-    # --------------------------------------------------------
-    dem_array = dem_raw.copy()
+    # ============================================================
+    # STEP 3 — TOPOGRAPHIC CONCAVITY (STORAGE DEPTH)
+    # ============================================================
+    dem_array = np.array(dem_raw, dtype="float64")
     mask_valid = np.isfinite(dem_array)
-    if not np.any(mask_valid):
-        # Degenerate case
-        HSR_static = np.zeros_like(dem_array)
-        HSR_rain_map = np.zeros_like(dem_array)
-        diagnostics["n_concavities"] = 0
-        return parcels, diagnostics, HSR_static, HSR_rain_map
+    fill_value = np.nanmean(dem_array)
 
-    fill_value = float(np.nanmean(dem_array[mask_valid]))
     dem_for_morph = dem_array.copy()
     dem_for_morph[~mask_valid] = fill_value
 
-    win = int(concavity_window)
+    win = concavity_window
     dem_closed = grey_closing(dem_for_morph, size=(win, win))
     dem_closed[~mask_valid] = np.nan
 
@@ -115,74 +151,72 @@ def run_hsr_analysis(
     storage_depth = np.where(storage_depth > 0, storage_depth, 0.0)
 
     positive = storage_depth[storage_depth > 0]
+
     if positive.size == 0:
+        # No concavities detected
         dep_labels = np.zeros_like(storage_depth, dtype="int32")
         n_deps = 0
-        DEP_THRESHOLD = float("nan")
-    else:
-        DEP_THRESHOLD = float(np.percentile(positive, 50.0))
-        concavity_mask = storage_depth >= DEP_THRESHOLD
-        dep_labels, n_deps = ndimage.label(concavity_mask, structure=np.ones((3, 3)))
-
-    diagnostics["concavity_min"] = float(positive.min()) if positive.size > 0 else 0.0
-    diagnostics["concavity_max"] = float(positive.max()) if positive.size > 0 else 0.0
-    diagnostics["concavity_median"] = float(np.median(positive)) if positive.size > 0 else 0.0
-    diagnostics["concavity_threshold_m"] = float(DEP_THRESHOLD)
-    diagnostics["n_concavities"] = int(n_deps)
-
-    # --------------------------------------------------------
-    # STEP 3 – Static storage volume (m³) per cell
-    # --------------------------------------------------------
-    if n_deps == 0:
+        dep_threshold = None
         storage_volumes = np.array([])
+        inflow_volumes = np.array([])
         HSR_static = np.zeros_like(dem_array, dtype="float64")
+        HSR_rain_map = np.zeros_like(dem_array, dtype="float64")
     else:
+        # Dynamic threshold: keep deeper half of concavities
+        dep_threshold = float(np.percentile(positive, 50))
+        concavity_mask = storage_depth >= dep_threshold
+
+        dep_labels, n_deps = ndimage.label(
+            concavity_mask, structure=np.ones((3, 3), dtype="int32")
+        )
+
+        # ============================================================
+        # STEP 4 — STATIC STORAGE VOLUME (HSR_static)
+        # ============================================================
         storage_volumes = ndimage.sum(
             storage_depth * cell_area,
             dep_labels,
             index=np.arange(1, n_deps + 1),
         )
+
         HSR_static = np.zeros_like(dem_array, dtype="float64")
         for dep_id, vol in enumerate(storage_volumes, start=1):
             HSR_static[dep_labels == dep_id] = vol
 
-    diagnostics["HSR_static_total_m3"] = float(np.nansum(HSR_static))
+        # ============================================================
+        # STEP 5 — RUNOFF (SCS–CN)
+        # ============================================================
+        rain = rainfall_mm
+        CN = np.where((cn > 0) & np.isfinite(cn), cn, np.nan)
 
-    # --------------------------------------------------------
-    # STEP 4 – Runoff (SCS–CN, mm)
-    # --------------------------------------------------------
-    CN = np.where((cn > 0) & np.isfinite(cn), cn, np.nan)
-    S = (25400.0 / CN) - 254.0
-    Ia = 0.2 * S
+        S = (25400.0 / CN) - 254.0
+        Ia = 0.2 * S
 
-    rain = float(rainfall_mm)
-    runoff = np.where(
-        np.isfinite(CN) & (rain > Ia),
-        ((rain - Ia) ** 2) / ((rain - Ia) + S),
-        0.0,
-    )
-    runoff = np.where(np.isfinite(runoff), runoff, 0.0)
+        runoff = np.where(
+            np.isfinite(CN) & (rain > Ia),
+            ((rain - Ia) ** 2) / ((rain - Ia) + S),
+            0.0,
+        )
+        runoff = np.where(np.isfinite(runoff), runoff, 0.0)
 
-    diagnostics["runoff_mean_mm"] = float(np.nanmean(runoff))
-    diagnostics["runoff_max_mm"] = float(np.nanmax(runoff))
+        # Save temporary runoff raster so we can reuse pysheds grid
+        runoff_path = tmp_dir / "runoff_weights.tif"
+        runoff_profile = dem_profile.copy()
+        runoff_profile.update(dtype="float32", count=1, nodata=np.nan)
+        with rasterio.open(runoff_path, "w", **runoff_profile) as dst:
+            dst.write(runoff.astype("float32"), 1)
 
-    # --------------------------------------------------------
-    # STEP 5 – Weighted flow accumulation (mm)
-    # --------------------------------------------------------
-    runoff_grid = runoff.astype("float64")
-    fdir = grid.flowdir(dem_flat)
-    wacc = grid.accumulation(fdir, weights=runoff_grid)
-    wacc_array = np.array(wacc, dtype="float64")
+        # ============================================================
+        # STEP 6 — WEIGHTED FLOW ACCUMULATION
+        # ============================================================
+        runoff_grid = grid.read_raster(str(runoff_path))
+        fdir = grid.flowdir(dem_flat)
+        wacc = grid.accumulation(fdir, weights=runoff_grid)
+        wacc_array = np.array(wacc, dtype="float64")
 
-    diagnostics["wacc_max_mm"] = float(np.nanmax(wacc_array))
-
-    # --------------------------------------------------------
-    # STEP 6 – Inflow & HSR_rain (m³)
-    # --------------------------------------------------------
-    if n_deps == 0:
-        inflow_volumes = np.array([])
-        HSR_rain_map = np.zeros_like(dem_array, dtype="float64")
-    else:
+        # ============================================================
+        # STEP 7 — INFLOW VOLUME & HSR_rain
+        # ============================================================
         inflow_mm = ndimage.maximum(
             wacc_array,
             dep_labels,
@@ -195,51 +229,66 @@ def run_hsr_analysis(
         for dep_id, val in enumerate(HSR_rain, start=1):
             HSR_rain_map[dep_labels == dep_id] = val
 
-    diagnostics["HSR_rain_total_m3"] = float(np.nansum(HSR_rain_map))
+    # ============================================================
+    # STEP 8 — PARCEL-LEVEL ZONAL STATISTICS
+    # ============================================================
+    parcels = gpd.read_file(parcels_path)
+    if parcels.crs is None:
+        raise ValueError("Parcels layer has no CRS. Please define a CRS.")
 
-    # --------------------------------------------------------
-    # STEP 7 – Parcel-level zonal statistics (using in-memory arrays)
-    # --------------------------------------------------------
+    # Reproject parcels to the UTM CRS of the DEM
+    dem_crs = dem_profile["crs"]
+    if parcels.crs.to_string() != dem_crs.to_string():
+        parcels = parcels.to_crs(dem_crs)
+
+    def _safe_get(d, key):
+        return d.get(key, 0.0) if isinstance(d, dict) else 0.0
+
+    # Static storage zonal stats
     static_stats = zonal_stats(
-        parcels.geometry,
-        HSR_static,
-        affine=dem_transform,
+        vectors=parcels.geometry,
+        raster=HSR_static,
+        affine=dem_profile["transform"],
         stats=["sum", "mean", "max"],
         nodata=np.nan,
-        all_touched=False,
     )
+    # Rainfall-adjusted storage zonal stats
     rain_stats = zonal_stats(
-        parcels.geometry,
-        HSR_rain_map,
-        affine=dem_transform,
+        vectors=parcels.geometry,
+        raster=HSR_rain_map,
+        affine=dem_profile["transform"],
         stats=["sum", "mean", "max"],
         nodata=np.nan,
-        all_touched=False,
     )
 
-    parcels["HSR_static_sum"] = [d.get("sum", 0.0) for d in static_stats]
-    parcels["HSR_static_mean"] = [d.get("mean", 0.0) for d in static_stats]
-    parcels["HSR_static_max"] = [d.get("max", 0.0) for d in static_stats]
+    parcels["HSR_static_sum"] = [_safe_get(d, "sum") for d in static_stats]
+    parcels["HSR_static_mean"] = [_safe_get(d, "mean") for d in static_stats]
+    parcels["HSR_static_max"] = [_safe_get(d, "max") for d in static_stats]
 
-    parcels["HSR_rain_sum"] = [d.get("sum", 0.0) for d in rain_stats]
-    parcels["HSR_rain_mean"] = [d.get("mean", 0.0) for d in rain_stats]
-    parcels["HSR_rain_max"] = [d.get("max", 0.0) for d in rain_stats]
+    parcels["HSR_rain_sum"] = [_safe_get(d, "sum") for d in rain_stats]
+    parcels["HSR_rain_mean"] = [_safe_get(d, "mean") for d in rain_stats]
+    parcels["HSR_rain_max"] = [_safe_get(d, "max") for d in rain_stats]
 
-    # --------------------------------------------------------
-    # STEP 8 – Normalisation & 10-class classification (parcel level)
-    # Higher HSR_rain → more storage → more protection value
-    # --------------------------------------------------------
-    parcels["HSR_static_norm"] = _normalize_minmax(parcels["HSR_static_sum"].values)
-    parcels["HSR_rain_norm"] = _normalize_minmax(parcels["HSR_rain_sum"].values)
-
-    # 10-class deciles on rainfall-adjusted storage
-    parcels["HSR_rain_class_10"] = pd.qcut(
-        parcels["HSR_rain_norm"].rank(method="first"),
-        q=10,
-        labels=[str(i) for i in range(1, 11)],  # "1" (lowest) … "10" (highest)
+    # ------------------------------------------------------------
+    # Diagnostics
+    # ------------------------------------------------------------
+    total_storage_m3 = float(np.sum(storage_volumes)) if storage_volumes.size else 0.0
+    total_rain_storage_m3 = (
+        float(np.sum(np.minimum(storage_volumes, inflow_volumes)))
+        if (storage_volumes.size and inflow_volumes.size)
+        else 0.0
     )
 
-    diagnostics["HSR_rain_min_norm"] = float(parcels["HSR_rain_norm"].min())
-    diagnostics["HSR_rain_max_norm"] = float(parcels["HSR_rain_norm"].max())
+    diagnostics = {
+        "rainfall_mm": float(rainfall_mm),
+        "target_crs": str(dem_crs),
+        "cell_size_m": float(cell_size),
+        "cell_area_m2": float(cell_area),
+        "concavity_window": int(concavity_window),
+        "n_concavities": int(n_deps),
+        "dep_threshold_m": float(dep_threshold) if dep_threshold is not None else None,
+        "total_storage_m3": total_storage_m3,
+        "total_rain_storage_m3": total_rain_storage_m3,
+    }
 
-    return parcels, diagnostics, HSR_static, HSR_rain_map
+    return parcels, diagnostics
