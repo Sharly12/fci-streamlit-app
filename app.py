@@ -76,8 +76,8 @@ models_info = [
         "name": "Hydrological Storage Role",
         "emoji": "💧",
         "description": "Analyzes water storage capacity and retention patterns across the landscape.",
-        "implemented": False,            # placeholder only
-        "page": None,
+        "implemented": True,            # placeholder only
+        "page": "pages/1_HSR_Analysis.py",
     },
     {
         "id": "fci",
@@ -192,4 +192,5 @@ st.button("Run All Models (coming soon)", disabled=True, use_container_width=Tru
 
 st.write("")
 st.caption("Tip: You can also open the FCI page from the left sidebar navigation.")
+
 
