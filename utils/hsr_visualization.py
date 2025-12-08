@@ -10,7 +10,15 @@ def build_hsr_map(parcels_gdf: gpd.GeoDataFrame, rainfall_mm: float):
     Build an interactive Folium map with:
     - HSR_rain_sum (rainfall-adjusted storage, m³)
     - HSR_static_sum (static storage, m³)
+
+    NOTE: Choropleths must be added directly to the Map object
+    (Folium asserts on this), so we don't wrap them in FeatureGroups.
     """
+
+    if parcels_gdf.empty:
+        # Fallback empty map if something went wrong upstream
+        m = folium.Map(location=[0, 0], zoom_start=2, tiles="cartodbpositron")
+        return m
 
     # Reproject to WGS84 for web mapping
     parcels_wgs = parcels_gdf.to_crs(epsg=4326).copy()
@@ -23,15 +31,14 @@ def build_hsr_map(parcels_gdf: gpd.GeoDataFrame, rainfall_mm: float):
 
     m = folium.Map(location=[center_y, center_x], zoom_start=13, tiles="cartodbpositron")
 
+    geojson_str = parcels_wgs.to_json()
+
     # ------------------------------------------------------------------
-    # Rainfall-adjusted storage layer
+    # Rainfall-adjusted storage layer (Choropleth added directly to Map)
     # ------------------------------------------------------------------
     if "HSR_rain_sum" in parcels_wgs.columns:
-        rain_fg = folium.FeatureGroup(
-            name=f"HSR – Rainfall-adjusted storage (sum, m³)", show=False
-        )
-        folium.Choropleth(
-            geo_data=parcels_wgs.to_json(),
+        rain_choro = folium.Choropleth(
+            geo_data=geojson_str,
             data=parcels_wgs,
             columns=["idx", "HSR_rain_sum"],
             key_on="feature.properties.idx",
@@ -40,18 +47,16 @@ def build_hsr_map(parcels_gdf: gpd.GeoDataFrame, rainfall_mm: float):
             line_opacity=0.2,
             nan_fill_opacity=0,
             legend_name=f"HSR_rain_sum (m³) – Rainfall {rainfall_mm:.0f} mm",
-        ).add_to(rain_fg)
-        rain_fg.add_to(m)
+            name="HSR – Rainfall-adjusted storage (sum, m³)",
+        )
+        rain_choro.add_to(m)
 
     # ------------------------------------------------------------------
-    # Static storage layer
+    # Static storage layer (second Choropleth, also on Map)
     # ------------------------------------------------------------------
     if "HSR_static_sum" in parcels_wgs.columns:
-        static_fg = folium.FeatureGroup(
-            name="HSR – Static storage (sum, m³)", show=True
-        )
-        folium.Choropleth(
-            geo_data=parcels_wgs.to_json(),
+        static_choro = folium.Choropleth(
+            geo_data=geojson_str,
             data=parcels_wgs,
             columns=["idx", "HSR_static_sum"],
             key_on="feature.properties.idx",
@@ -60,10 +65,13 @@ def build_hsr_map(parcels_gdf: gpd.GeoDataFrame, rainfall_mm: float):
             line_opacity=0.2,
             nan_fill_opacity=0,
             legend_name="HSR_static_sum (m³)",
-        ).add_to(static_fg)
-        static_fg.add_to(m)
+            name="HSR – Static storage (sum, m³)",
+        )
+        static_choro.add_to(m)
 
-    # Tooltip layer (same geometry, just outlines)
+    # ------------------------------------------------------------------
+    # Tooltip layer – outline only, for both HSR fields
+    # ------------------------------------------------------------------
     tooltip_fields = []
     if "HSR_rain_sum" in parcels_wgs.columns:
         tooltip_fields.append("HSR_rain_sum")
@@ -72,12 +80,17 @@ def build_hsr_map(parcels_gdf: gpd.GeoDataFrame, rainfall_mm: float):
 
     if tooltip_fields:
         folium.GeoJson(
-            parcels_wgs.to_json(),
+            geojson_str,
             name="Parcel info",
             style_function=lambda x: {
                 "fillOpacity": 0.0,
                 "color": "black",
                 "weight": 0.5,
+            },
+            highlight_function=lambda x: {
+                "weight": 2,
+                "color": "black",
+                "fillOpacity": 0.0,
             },
             tooltip=folium.GeoJsonTooltip(
                 fields=tooltip_fields,
