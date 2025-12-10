@@ -94,8 +94,8 @@ models_info = [
         "name": "Parcel Elevation Context",
         "emoji": "⛰️",
         "description": "Assesses elevation-based risk factors and topographical context for each parcel.",
-        "implemented": False,
-        "page": None,
+        "implemented": True,
+        "page": "pages/3_PEC_Analysis.py",
     },
     {
         "id": "uds",
@@ -192,6 +192,7 @@ st.button("Run All Models (coming soon)", disabled=True, use_container_width=Tru
 
 st.write("")
 st.caption("Tip: You can also open the FCI page from the left sidebar navigation.")
+
 
 
 
