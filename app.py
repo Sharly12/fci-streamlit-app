@@ -103,8 +103,8 @@ models_info = [
         "name": "Upstream–Downstream Sensitivity",
         "emoji": "🔁",
         "description": "Measures interdependence between upstream and downstream areas.",
-        "implemented": False,
-        "page": None,
+        "implemented": True,
+        "page": "pages/4_UDS_Analysis.py",
     },
     {
         "id": "sei",
@@ -192,5 +192,6 @@ st.button("Run All Models (coming soon)", disabled=True, use_container_width=Tru
 
 st.write("")
 st.caption("Tip: You can also open the FCI page from the left sidebar navigation.")
+
 
 
