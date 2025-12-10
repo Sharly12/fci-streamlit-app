@@ -14,10 +14,10 @@ st.write(
 The Parcel Elevation Context (PEC) model characterises each parcel's
 topographic setting using:
 
-- **Elevation & relief** (DEM min / max / mean)
-- **Slope** (mean parcel slope)
-- **Local relative elevation** (PREI = DEM - neighbourhood mean, ~250 m)
-- **Hydrologic position** via HAND (elevation above streams)
+- **Elevation & relief** (DEM min / max / mean)  
+- **Slope** (mean parcel slope, from DEM gradients)  
+- **Local relative elevation** (PREI = DEM − neighbourhood mean)  
+- **HAND proxy** (elevation above local minimum in a neighbourhood)
 
 These indicators are combined into a **PEC class**:
 
@@ -26,8 +26,8 @@ These indicators are combined into a **PEC class**:
 3. Locally High & Disconnected  
 4. Moderate / Context-Dependent  
 
-You can optionally apply a rainfall depth so that thresholds and PREI
-are adjusted to reflect more intense events.
+You can optionally supply a rainfall depth so that thresholds are
+adjusted to reflect more intense events.
 """
 )
 
@@ -46,7 +46,7 @@ with st.sidebar:
         help="Set to 0 for purely static PEC (no rainfall adjustment).",
     )
 
-    neighbourhood_radius_m = st.slider(
+    prei_radius_m = st.slider(
         "Neighbourhood radius for PREI (m)",
         min_value=100.0,
         max_value=500.0,
@@ -55,13 +55,13 @@ with st.sidebar:
         help="Radius for computing neighbourhood mean elevation.",
     )
 
-    stream_threshold = st.slider(
-        "Flow accumulation threshold for streams (cells)",
-        min_value=100,
-        max_value=2000,
-        value=400,
-        step=100,
-        help="Higher values = only major streams; lower = more streams.",
+    hand_radius_m = st.slider(
+        "Neighbourhood radius for HAND proxy (m)",
+        min_value=50.0,
+        max_value=400.0,
+        value=150.0,
+        step=50.0,
+        help="Controls how far 'downhill' the HAND-like proxy looks.",
     )
 
 run_btn = st.button("Run PEC Analysis")
@@ -71,14 +71,14 @@ run_btn = st.button("Run PEC Analysis")
 # --------------------------------------------------------------
 @st.cache_data(show_spinner="Running PEC engine …")
 def _run_pec_cached(
-    dem_path, parcels_path, rainfall_mm, neighbourhood_radius_m, stream_threshold
+    dem_path, parcels_path, rainfall_mm, prei_radius_m, hand_radius_m
 ):
     return run_pec_analysis(
         dem_path=dem_path,
         parcels_path=parcels_path,
         rainfall_mm=rainfall_mm,
-        neighbourhood_radius_m=neighbourhood_radius_m,
-        stream_threshold=stream_threshold,
+        prei_radius_m=prei_radius_m,
+        hand_radius_m=hand_radius_m,
     )
 
 
@@ -93,8 +93,8 @@ if run_btn:
             dem_path,
             parcels_path,
             rainfall_mm,
-            neighbourhood_radius_m,
-            stream_threshold,
+            prei_radius_m,
+            hand_radius_m,
         )
 
         st.success("✅ PEC analysis complete")
@@ -110,30 +110,29 @@ if run_btn:
             )
         with c2:
             st.metric(
-                "Neighbourhood radius (m)",
-                f"{diagnostics.get('neighbourhood_radius_m', neighbourhood_radius_m):.0f}",
+                "PREI radius (m)",
+                f"{diagnostics.get('prei_radius_m', prei_radius_m):.0f}",
             )
             st.metric(
-                "Radius (pixels)",
-                diagnostics.get("radius_pixels", 0),
+                "PREI radius (pixels)",
+                diagnostics.get("prei_radius_pixels", 0),
             )
         with c3:
             st.metric(
-                "Stream threshold (cells)",
-                diagnostics.get("stream_threshold_cells", stream_threshold),
+                "HAND radius (m)",
+                f"{diagnostics.get('hand_radius_m', hand_radius_m):.0f}",
             )
-            st.metric("Rainfall (mm)", f"{diagnostics.get('rainfall_mm', rainfall_mm):.0f}")
+            st.metric(
+                "HAND radius (pixels)",
+                diagnostics.get("hand_radius_pixels", 0),
+            )
 
-        # Class counts
         class_counts = diagnostics.get("pec_class_counts", {})
         if class_counts:
             st.write("**Parcel counts by PEC class**")
             cc_df = (
                 pd.DataFrame(
-                    [
-                        {"PEC class": k, "Parcels": v}
-                        for k, v in class_counts.items()
-                    ]
+                    [{"PEC class": k, "Parcels": v} for k, v in class_counts.items()]
                 )
                 .sort_values("Parcels", ascending=False)
                 .reset_index(drop=True)
@@ -148,7 +147,6 @@ if run_btn:
         # ---------- Tables & download ----------
         st.subheader("Parcel-level PEC indicators (top 10 by risk)")
 
-        # Order: Retention + High risk first
         risk_order = [
             "Low-lying Depressed (Retention Priority)",
             "Flat & Pressured (High Flood Exposure Risk)",
@@ -174,9 +172,7 @@ if run_btn:
         existing_cols = [c for c in cols if c in parcels_pec.columns]
 
         table_df = (
-            parcels_pec.sort_values(["pec_rank", "hand_score"])
-            [existing_cols]
-            .head(10)
+            parcels_pec.sort_values(["pec_rank", "hand_score"])[existing_cols].head(10)
         )
 
         st.dataframe(
@@ -194,8 +190,14 @@ if run_btn:
             )
         )
 
-        # CSV download of all parcels
-        export_cols = ["grid_id", "pec_class", "pec_code", "prei", "hand_score", "relief"]
+        export_cols = [
+            "grid_id",
+            "pec_class",
+            "pec_code",
+            "prei",
+            "hand_score",
+            "relief",
+        ]
         export_cols = [c for c in export_cols if c in parcels_pec.columns]
         export_df = parcels_pec[export_cols].copy()
 
