@@ -1,106 +1,123 @@
 # utils/pec_visualization.py
+
+import geopandas as gpd
 import folium
-import numpy as np
-from branca.colormap import LinearColormap
 
 
-PEC_COLORS = {
-    "Low-lying Depressed (Retention Priority)": "#3182bd",  # blue
-    "Flat & Pressured (High Flood Exposure Risk)": "#de2d26",  # red
-    "Locally High & Disconnected": "#31a354",  # green
-    "Moderate / Context-Dependent": "#fed976",  # yellow/orange
-}
-
-
-def build_pec_map(parcels_pec, rainfall_mm: float = 0.0):
+def build_pec_map(parcels_pec, rainfall_label=None):
     """
-    Build interactive PEC map with categorical styling and tooltips.
-    """
+    Build an interactive PEC map with the SAME colours as the
+    original matplotlib PEC script.
 
-    gdf = parcels_pec.to_crs(epsg=4326)
-    bounds = gdf.total_bounds  # minx, miny, maxx, maxy
-    cx = (bounds[0] + bounds[2]) / 2.0
-    cy = (bounds[1] + bounds[3]) / 2.0
+    Parameters
+    ----------
+    parcels_pec : GeoDataFrame
+        Output of the PEC model. Must contain a 'pec_class' column.
+    rainfall_label : optional
+        If not None, a small note is added to the layer name
+        (e.g. 'Rainfall 100 mm/h'). This keeps compatibility with
+        the current page code, which may pass a label.
+    """
+    if parcels_pec is None or len(parcels_pec) == 0:
+        raise ValueError("parcels_pec is empty – nothing to map.")
+
+    if "pec_class" not in parcels_pec.columns:
+        raise ValueError("GeoDataFrame must contain a 'pec_class' column.")
+
+    if parcels_pec.crs is None:
+        raise ValueError("PEC GeoDataFrame has no CRS defined.")
+
+    # --- Colour scheme: EXACT match to your original script ---
+    pec_colors = {
+        "Low-lying Depressed (Retention Priority)": "#0000FF",  # blue
+        "Flat & Pressured (High Flood Exposure Risk)": "#FF0000",  # red
+        "Locally High & Disconnected": "#008000",  # green
+        "Moderate / Context-Dependent": "#FFFF00",  # yellow
+    }
+
+    # Work in WGS84 for Folium
+    gdf = parcels_pec.copy().to_crs(epsg=4326)
+
+    # Add a colour column used only for styling
+    gdf["__color__"] = gdf["pec_class"].map(pec_colors).fillna("#999999")
+
+    # Map centre
+    center_y = gdf.geometry.centroid.y.mean()
+    center_x = gdf.geometry.centroid.x.mean()
+
+    layer_name = "Parcel Elevation Context (PEC)"
+    if rainfall_label is not None:
+        layer_name += f" – Rainfall {rainfall_label} mm/h"
 
     m = folium.Map(
-        location=[cy, cx],
+        location=[center_y, center_x],
         zoom_start=13,
-        tiles="CartoDB positron",
+        tiles="cartodbpositron",
         control_scale=True,
     )
 
-    folium.TileLayer("OpenStreetMap", name="OpenStreetMap").add_to(m)
-    folium.TileLayer("CartoDB positron", name="CartoDB positron", control=False).add_to(m)
-
-    def style_fn(feat):
-        cls = feat["properties"].get("pec_class", "Moderate / Context-Dependent")
-        color = PEC_COLORS.get(cls, "#999999")
+    # Style function uses the pre-computed colour
+    def style_fn(feature):
         return {
-            "fillColor": color,
-            "color": "#444444",
+            "fillColor": feature["properties"].get("__color__", "#999999"),
+            "color": "#000000",
             "weight": 0.3,
-            "fillOpacity": 0.7,
+            "fillOpacity": 0.8,
         }
 
-    tooltip = folium.GeoJsonTooltip(
-        fields=[
-            "grid_id",
-            "pec_class",
-            "prei",
-            "hand_score",
-            "relief",
-        ],
-        aliases=[
-            "Parcel ID:",
-            "PEC class:",
-            "PREI (rel. elev.):",
-            "HAND score:",
-            "Relief (max-min, m):",
-        ],
-        localize=True,
-        sticky=False,
+    tooltip = folium.features.GeoJsonTooltip(
+        fields=["pec_class"],
+        aliases=["PEC class:"],
+        sticky=True,
     )
 
     folium.GeoJson(
-        gdf,
-        name=f"PEC classification (rainfall {int(rainfall_mm)} mm)",
+        gdf.to_json(),
+        name=layer_name,
         style_function=style_fn,
         tooltip=tooltip,
     ).add_to(m)
 
-    # Discrete legend (simple HTML)
+    # --- Legend with the same four colours & labels ---
     legend_html = """
     <div style="
         position: fixed;
-        bottom: 40px;
-        left: 10px;
+        bottom: 30px;
+        left: 30px;
         z-index: 9999;
         background-color: white;
-        padding: 8px 10px;
-        border: 1px solid #ccc;
-        border-radius: 6px;
-        box-shadow: 0 0 3px rgba(0,0,0,0.3);
-        font-size: 12px;
+        border: 2px solid #444444;
+        padding: 10px;
+        border-radius: 4px;
+        font-size: 13px;
     ">
-      <b>PEC Classes</b><br>
-      <span style="background:{c1};width:12px;height:12px;display:inline-block;margin-right:4px;"></span>
-      Low-lying Depressed (Retention Priority)<br>
-      <span style="background:{c2};width:12px;height:12px;display:inline-block;margin-right:4px;"></span>
-      Flat &amp; Pressured (High Flood Exposure Risk)<br>
-      <span style="background:{c3};width:12px;height:12px;display:inline-block;margin-right:4px;"></span>
-      Locally High &amp; Disconnected<br>
-      <span style="background:{c4};width:12px;height:12px;display:inline-block;margin-right:4px;"></span>
-      Moderate / Context-Dependent
+      <b>PEC class</b><br>
+      <div style="margin-top:4px">
+        <div>
+          <span style="background:#0000FF; width:12px; height:12px;
+                       display:inline-block; margin-right:4px;"></span>
+          Low-lying Depressed (Retention Priority)
+        </div>
+        <div>
+          <span style="background:#FF0000; width:12px; height:12px;
+                       display:inline-block; margin-right:4px;"></span>
+          Flat &amp; Pressured (High Flood Exposure Risk)
+        </div>
+        <div>
+          <span style="background:#008000; width:12px; height:12px;
+                       display:inline-block; margin-right:4px;"></span>
+          Locally High &amp; Disconnected
+        </div>
+        <div>
+          <span style="background:#FFFF00; width:12px; height:12px;
+                       display:inline-block; margin-right:4px;"></span>
+          Moderate / Context-Dependent
+        </div>
+      </div>
     </div>
-    """.format(
-        c1=PEC_COLORS["Low-lying Depressed (Retention Priority)"],
-        c2=PEC_COLORS["Flat & Pressured (High Flood Exposure Risk)"],
-        c3=PEC_COLORS["Locally High & Disconnected"],
-        c4=PEC_COLORS["Moderate / Context-Dependent"],
-    )
+    """
 
     m.get_root().html.add_child(folium.Element(legend_html))
-
-    folium.LayerControl(collapsed=False).add_to(m)
+    folium.LayerControl().add_to(m)
 
     return m
