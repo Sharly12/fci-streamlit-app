@@ -1,15 +1,14 @@
+streamlit
 geopandas
-shapely
 rasterio
-pyproj
-rtree
-richdem
-pysheds
-xarray
-numpy
-pandas
-matplotlib
-folium
-streamlit_folium
+shapely
 fiona
+pyproj
+rasterstats
+pysheds
+folium
+streamlit-folium
+requests
+matplotlib
+whitebox
 
