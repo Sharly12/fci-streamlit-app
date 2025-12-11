@@ -1,4 +1,5 @@
 # pages/3_PEC_Analysis.py
+
 import streamlit as st
 from streamlit_folium import folium_static
 
@@ -17,7 +18,8 @@ local terrain:
 - **HAND-like score** – height above nearest drainage / valley bottom
 - **Relief** – min–max elevation range within the parcel
 
-These indicators are combined to classify parcels into four PEC categories.
+These indicators are combined to classify parcels into four PEC categories,
+using the same rules and colours as your original script.
 """
 )
 
@@ -27,6 +29,7 @@ These indicators are combined to classify parcels into four PEC categories.
 with st.sidebar:
     st.header("PEC Parameters")
 
+    # Radius used for neighbourhood mean in the model
     prei_radius_m = st.slider(
         "Neighbourhood radius for PREI (m)",
         min_value=100.0,
@@ -35,14 +38,7 @@ with st.sidebar:
         step=25.0,
     )
 
-    stream_threshold = st.slider(
-        "Flow accumulation threshold for streams",
-        min_value=100,
-        max_value=1000,
-        value=400,
-        step=50,
-    )
-
+    # Only used for legend text on the map (no re-classification)
     rainfall_mm = st.slider(
         "Reference rainfall for legend (mm/h)",
         min_value=50.0,
@@ -54,32 +50,30 @@ with st.sidebar:
 run_btn = st.button("Run PEC Analysis")
 
 # --------------------------------------------------------------------
-# Cached wrapper
+# Cached wrapper (matches current run_pec_analysis signature)
 # --------------------------------------------------------------------
 @st.cache_resource(show_spinner="🧮 Running PEC model …")
 def _run_pec_cached(
     dem_path: str,
     parcels_path: str,
     prei_radius_m: float,
-    stream_threshold: float,
 ):
     return run_pec_analysis(
         dem_path=dem_path,
         parcels_path=parcels_path,
         prei_radius_m=prei_radius_m,
-        stream_threshold=stream_threshold,
     )
-
 
 # --------------------------------------------------------------------
 # Main logic
 # --------------------------------------------------------------------
 if run_btn:
     try:
+        # get_data_paths returns (DEM, PARCELS, CN) for your Dropbox geojson setup
         dem_path, parcels_path, cn_path = get_data_paths()
 
         parcels_pec, diagnostics = _run_pec_cached(
-            dem_path, parcels_path, prei_radius_m, stream_threshold
+            dem_path, parcels_path, prei_radius_m
         )
 
         st.success("✅ PEC analysis complete.")
@@ -87,21 +81,21 @@ if run_btn:
         # Diagnostics summary
         st.subheader("Diagnostics & summary")
 
-        c1, c2, c3 = st.columns(3)
+        c1, c2 = st.columns(2)
         with c1:
-            st.metric("Parcels analysed", diagnostics.get("n_parcels", len(parcels_pec)))
+            st.metric(
+                "Parcels analysed",
+                diagnostics.get("n_parcels", len(parcels_pec)),
+            )
         with c2:
             st.metric(
                 "PREI radius (m)",
-                f"{diagnostics.get('prei_radius_m', prei_radius_m):.0f}",
-            )
-        with c3:
-            st.metric(
-                "Stream threshold (cells)",
-                f"{diagnostics.get('stream_threshold', stream_threshold):.0f}",
+                f"{diagnostics.get('prei_radius_m', prei_radius_m):.0f}"
+                if isinstance(diagnostics.get("prei_radius_m", None), (int, float))
+                else f"{prei_radius_m:.0f}",
             )
 
-        # Class counts
+        # Class counts table if available
         class_counts = diagnostics.get("class_counts", {})
         if class_counts:
             st.write("**PEC class distribution (parcels)**")
@@ -112,12 +106,12 @@ if run_btn:
                 }
             )
 
-        # Map
+        # Map with the correct blue/red/green/yellow scheme
         st.subheader("Interactive PEC Map")
         pec_map = build_pec_map(parcels_pec, rainfall_label=rainfall_mm)
         folium_static(pec_map, width=1000, height=600)
 
-        # Optional: show top rows for QA
+        # Optional sample attribute table
         with st.expander("Show sample attribute table"):
             cols_show = [
                 "grid_id",
@@ -136,4 +130,4 @@ if run_btn:
         st.error("PEC analysis failed. Please see the error below.")
         st.exception(e)
 else:
-    st.info("Adjust parameters on the left and click **Run PEC Analysis**.")
+    st.info("Adjust the PREI radius and click **Run PEC Analysis**.")
