@@ -1,21 +1,20 @@
 # models/pec_model.py
 """
-Parcel Elevation Context (PEC) model – pysheds-based, no WhiteboxTools.
+Parcel Elevation Context (PEC) model – pysheds-based (no WhiteboxTools).
 
-This is a function-style version of your long PEC script, so that the
-Streamlit app can call it. It reproduces the same logic:
+This is a function-style version of your PEC workflow, designed for use
+inside the Streamlit app.
+
+It reproduces your logic:
 
 1. Clip DEM to parcel extent
 2. DEM conditioning (fill pits/depressions, resolve flats) with pysheds
-3. Slope (degrees) from DEM gradients
-4. Local relative elevation (DEM – neighbourhood mean, ~250 m)
-5. HAND-like index using flow direction, accumulation and streams
+3. Slope (degrees) from gradients
+4. Local relative elevation (PREI = DEM − neighbourhood mean, ~250 m window)
+5. HAND-like score via flow direction, accumulation & stream mask
 6. Zonal stats per parcel
 7. PEC indicators + classification into 4 classes
-8. Optional rainfall-aware PEC (thresholds adjusted by rainfall_mm)
-
-Inputs (DEM, parcels) are passed in from utils.data_loader.get_data_paths(),
-which already downloads from your Dropbox links.
+8. Optional rainfall-adjusted PEC (thresholds modified by rainfall_mm)
 """
 
 from pathlib import Path
@@ -31,9 +30,10 @@ import pandas as pd
 
 
 # ------------------------------------------------------------------
-# Internal helpers
+# Helpers
 # ------------------------------------------------------------------
 def _ensure_grid_id(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Ensure a 'grid_id' column exists."""
     if "grid_id" not in gdf.columns:
         gdf = gdf.copy()
         gdf["grid_id"] = np.arange(1, len(gdf) + 1, dtype="int32")
@@ -83,7 +83,7 @@ def _classify_pec_rainfall(row, rainfall_mm: float):
 
 
 # ------------------------------------------------------------------
-# Main entry point for the app
+# MAIN ENTRY POINT
 # ------------------------------------------------------------------
 def run_pec_analysis(
     dem_path: str,
@@ -93,28 +93,30 @@ def run_pec_analysis(
     stream_threshold: int = 400,
 ):
     """
-    Run the full PEC workflow, returning a GeoDataFrame with PEC indicators
-    + classes, and a diagnostics dictionary.
+    Run the full PEC workflow.
 
     Parameters
     ----------
     dem_path : str
-        Path to DEM GeoTIFF.
+        Path to DEM GeoTIFF (downloaded via get_data_paths / Dropbox).
     parcels_path : str
-        Path to parcel polygons (GeoJSON / Shapefile).
+        Path to parcel GeoJSON / Shapefile (grid-network.geojson).
     rainfall_mm : float
         Rainfall depth for rainfall-aware PEC (0 = static PEC).
     neighbourhood_radius_m : float
         Radius (m) for neighbourhood mean elevation (PREI).
     stream_threshold : int
-        Flow accumulation cell threshold for stream extraction (HAND).
+        Flow accumulation (cells) threshold for stream extraction.
 
     Returns
     -------
     parcels_pec : GeoDataFrame
+        Parcels with PEC indicators and 'pec_class' string + 'pec_code' int.
     diagnostics : dict
+        Basic diagnostic info (counts, thresholds, etc.).
     """
 
+    # Where to drop intermediate rasters (optional, mainly for debugging)
     base_dir = Path(__file__).resolve().parents[1]
     out_dir = base_dir / "outputs" / "individual" / "pec"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -135,19 +137,19 @@ def run_pec_analysis(
         boundary_geom = [mapping(parcels.unary_union)]
         out_image, out_transform = mask(src, boundary_geom, crop=True)
 
-    # Single-band DEM array
+    # DEM as float, clean nodata & extreme negatives
     dem = out_image[0].astype("float64")
     nodata_in = dem_meta.get("nodata", None)
     if nodata_in is not None:
         dem = np.where(dem == nodata_in, np.nan, dem)
-    dem = np.where(dem < -1000, np.nan, dem)  # clean extreme negatives
+    dem = np.where(dem < -1000, np.nan, dem)
 
     if not np.isfinite(dem).any():
         raise ValueError("DEM is empty or all nodata within the parcel extent.")
 
     cellsize = float(abs(out_transform.a))
 
-    # Save clipped DEM (for provenance)
+    # Save clipped DEM
     dem_meta.update(
         height=dem.shape[0],
         width=dem.shape[1],
@@ -356,7 +358,7 @@ def run_pec_analysis(
     # Static PEC
     grid_gdf["pec_class_static"] = grid_gdf.apply(_classify_pec_static, axis=1)
 
-    # Rainfall-adjusted PEC (optional)
+    # Rainfall-adjusted PEC
     if rainfall_mm and rainfall_mm > 0:
         grid_gdf["pec_class_rainfall"] = grid_gdf.apply(
             lambda r: _classify_pec_rainfall(r, rainfall_mm), axis=1
