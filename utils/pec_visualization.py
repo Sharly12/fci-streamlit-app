@@ -1,106 +1,83 @@
 # utils/pec_visualization.py
+
 import folium
-import numpy as np
-from branca.colormap import LinearColormap
+import geopandas as gpd
 
-
+# Fixed colour scheme – matches your original Matplotlib map
 PEC_COLORS = {
-    "Low-lying Depressed (Retention Priority)": "#3182bd",  # blue
-    "Flat & Pressured (High Flood Exposure Risk)": "#de2d26",  # red
-    "Locally High & Disconnected": "#31a354",  # green
-    "Moderate / Context-Dependent": "#fed976",  # yellow/orange
+    "Low-lying Depressed (Retention Priority)": "#2166ac",   # blue
+    "Flat & Pressured (High Flood Exposure Risk)": "#b2182b", # red
+    "Locally High & Disconnected": "#1a9850",                # green
+    "Moderate / Context-Dependent": "#ffffbf",               # yellow
 }
 
 
-def build_pec_map(parcels_pec, rainfall_mm: float = 0.0):
+def build_pec_map(parcels_gdf: gpd.GeoDataFrame, rainfall_label=None):
     """
-    Build interactive PEC map with categorical styling and tooltips.
+    Build an interactive PEC map (Folium) with the same colours as the
+    original PEC plots.
     """
+    if parcels_gdf.crs is None:
+        raise ValueError("PEC parcels must have a CRS.")
 
-    gdf = parcels_pec.to_crs(epsg=4326)
-    bounds = gdf.total_bounds  # minx, miny, maxx, maxy
-    cx = (bounds[0] + bounds[2]) / 2.0
-    cy = (bounds[1] + bounds[3]) / 2.0
+    parcels_wgs = parcels_gdf.to_crs(epsg=4326)
+    centroid = parcels_wgs.geometry.unary_union.centroid
+
+    if rainfall_label is None:
+        title = "Parcel-level PEC classification"
+    else:
+        title = f"Parcel-level PEC classification (reference rainfall {rainfall_label:.0f} mm/h)"
 
     m = folium.Map(
-        location=[cy, cx],
+        location=[centroid.y, centroid.x],
         zoom_start=13,
-        tiles="CartoDB positron",
-        control_scale=True,
+        tiles="OpenStreetMap",
     )
 
-    folium.TileLayer("OpenStreetMap", name="OpenStreetMap").add_to(m)
-    folium.TileLayer("CartoDB positron", name="CartoDB positron", control=False).add_to(m)
-
-    def style_fn(feat):
-        cls = feat["properties"].get("pec_class", "Moderate / Context-Dependent")
-        color = PEC_COLORS.get(cls, "#999999")
+    def style_function(feature):
+        cls = feature["properties"].get("pec_class", "Moderate / Context-Dependent")
+        color = PEC_COLORS.get(cls, "#ffffbf")
         return {
             "fillColor": color,
-            "color": "#444444",
+            "color": "black",
             "weight": 0.3,
-            "fillOpacity": 0.7,
+            "fillOpacity": 0.8,
         }
 
-    tooltip = folium.GeoJsonTooltip(
-        fields=[
-            "grid_id",
-            "pec_class",
-            "prei",
-            "hand_score",
-            "relief",
-        ],
-        aliases=[
-            "Parcel ID:",
-            "PEC class:",
-            "PREI (rel. elev.):",
-            "HAND score:",
-            "Relief (max-min, m):",
-        ],
-        localize=True,
-        sticky=False,
-    )
-
     folium.GeoJson(
-        gdf,
-        name=f"PEC classification (rainfall {int(rainfall_mm)} mm)",
-        style_function=style_fn,
-        tooltip=tooltip,
+        parcels_wgs,
+        name="PEC parcels",
+        style_function=style_function,
+        tooltip=folium.features.GeoJsonTooltip(
+            fields=["grid_id", "pec_class"],
+            aliases=["Parcel ID", "PEC class"],
+            sticky=False,
+        ),
     ).add_to(m)
 
-    # Discrete legend (simple HTML)
-    legend_html = """
+    # HTML legend
+    legend_html = f"""
     <div style="
         position: fixed;
         bottom: 40px;
-        left: 10px;
-        z-index: 9999;
-        background-color: white;
+        left: 40px;
+        z-index:9999;
+        background-color: rgba(255,255,255,0.9);
         padding: 8px 10px;
-        border: 1px solid #ccc;
-        border-radius: 6px;
-        box-shadow: 0 0 3px rgba(0,0,0,0.3);
+        border-radius: 8px;
         font-size: 12px;
+        box-shadow: 0 0 5px rgba(0,0,0,0.3);
     ">
-      <b>PEC Classes</b><br>
-      <span style="background:{c1};width:12px;height:12px;display:inline-block;margin-right:4px;"></span>
-      Low-lying Depressed (Retention Priority)<br>
-      <span style="background:{c2};width:12px;height:12px;display:inline-block;margin-right:4px;"></span>
-      Flat &amp; Pressured (High Flood Exposure Risk)<br>
-      <span style="background:{c3};width:12px;height:12px;display:inline-block;margin-right:4px;"></span>
-      Locally High &amp; Disconnected<br>
-      <span style="background:{c4};width:12px;height:12px;display:inline-block;margin-right:4px;"></span>
-      Moderate / Context-Dependent
-    </div>
-    """.format(
-        c1=PEC_COLORS["Low-lying Depressed (Retention Priority)"],
-        c2=PEC_COLORS["Flat & Pressured (High Flood Exposure Risk)"],
-        c3=PEC_COLORS["Locally High & Disconnected"],
-        c4=PEC_COLORS["Moderate / Context-Dependent"],
-    )
+      <b>{title}</b><br>
+    """
+    for label, color in PEC_COLORS.items():
+        legend_html += (
+            f'<div><span style="display:inline-block;width:12px;height:12px;'
+            f'background:{color};border:1px solid #555;margin-right:4px;"></span>'
+            f'{label}</div>'
+        )
+    legend_html += "</div>"
 
     m.get_root().html.add_child(folium.Element(legend_html))
-
-    folium.LayerControl(collapsed=False).add_to(m)
-
+    folium.LayerControl().add_to(m)
     return m
