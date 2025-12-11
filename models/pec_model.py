@@ -1,309 +1,240 @@
 # models/pec_model.py
-"""
-Parcel Elevation Context (PEC) model for the Streamlit app.
-
-This implementation avoids WhiteboxTools so it runs safely on
-Streamlit Cloud (no external executables).
-
-Core indicators (per parcel):
-- dem_min, dem_max, dem_mean, relief
-- slope_mean  (derived from DEM using numpy gradients)
-- PREI (local relative elevation = DEM - neighbourhood mean)
-- HAND_proxy (elevation above local minimum within a given radius)
-
-These are combined into PEC classes:
-
-1. Low-lying Depressed (Retention Priority)
-2. Flat & Pressured (High Flood Exposure Risk)
-3. Locally High & Disconnected
-4. Moderate / Context-Dependent
-
-A rainfall depth (mm) can be supplied to slightly shift PREI and HAND
-thresholds, following your original Colab logic.
-"""
-
-from pathlib import Path
-import os
-
 import numpy as np
 import geopandas as gpd
 import rasterio
-from rasterio.mask import mask
 from rasterstats import zonal_stats
-from shapely.geometry import mapping
-from scipy.ndimage import uniform_filter, minimum_filter
+from pysheds.grid import Grid
+from scipy.ndimage import uniform_filter
+from typing import Tuple, Dict
+
+# Discrete PEC classes and colours (match original notebook)
+PEC_COLORS = {
+    "Low-lying Depressed (Retention Priority)": "blue",
+    "Flat & Pressured (High Flood Exposure Risk)": "red",
+    "Locally High & Disconnected": "green",
+    "Moderate / Context-Dependent": "yellow",
+}
+
+PEC_CLASS_TO_CODE = {
+    name: code for code, name in enumerate(PEC_COLORS.keys(), start=1)
+}
+
+# D8 encoding used by pysheds
+_D8_OFFSETS = {
+    1:   (0, 1),   # E
+    2:   (1, 1),   # SE
+    4:   (1, 0),   # S
+    8:   (1, -1),  # SW
+    16:  (0, -1),  # W
+    32:  (-1, -1), # NW
+    64:  (-1, 0),  # N
+    128: (-1, 1),  # NE
+}
 
 
-# ---------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------
-def _minmax(arr):
-    arr = np.asarray(arr, dtype="float64")
-    finite = arr[np.isfinite(arr)]
-    if finite.size == 0:
-        return np.zeros_like(arr)
-    vmin = float(np.nanmin(finite))
-    vmax = float(np.nanmax(finite))
-    if not np.isfinite(vmin) or not np.isfinite(vmax) or np.isclose(vmin, vmax):
-        return np.zeros_like(arr)
-    return (arr - vmin) / (vmax - vmin)
-
-
-def _classify_pec_static(row):
-    """Baseline (no rainfall adjustment) PEC classification."""
-    prei = row["prei"]
-    hand = row["hand_score"]
-    relief = row["relief"]
-    flat_flag = bool(row["slp_mean"] < 1.5)
-
-    if prei <= -0.5 and hand <= 1.5 and relief <= 3:
-        return "Low-lying Depressed (Retention Priority)"
-    elif flat_flag and hand <= 3.0:
-        return "Flat & Pressured (High Flood Exposure Risk)"
-    elif prei > 0.5 and hand > 5.0:
-        return "Locally High & Disconnected"
-    else:
-        return "Moderate / Context-Dependent"
-
-
-def _classify_pec_rainfall(row, rainfall_mm: float):
+def _compute_hand_from_streams(
+    dem: np.ndarray,
+    fdir: np.ndarray,
+    streams: np.ndarray,
+    valid_mask: np.ndarray,
+) -> np.ndarray:
     """
-    Rainfall-aware PEC classification, following your previous rules:
-      - PREI is reduced slightly with rainfall.
-      - HAND thresholds increase slightly with rainfall.
+    Approximate HAND (height above nearest drainage) by traversing
+    upstream from stream cells along the D8 flow network.
     """
-    prei_val = row["prei"] - 0.002 * rainfall_mm
-    hand = row["hand_score"]
-    relief = row["relief"]
-    flat_flag = bool(row["slp_mean"] < 1.5)
+    nrows, ncols = dem.shape
+    N = nrows * ncols
 
-    low_thresh = 1.5 + 0.01 * rainfall_mm
-    med_thresh = 3.0 + 0.01 * rainfall_mm
+    dem_flat = dem.reshape(N)
+    valid_flat = valid_mask.reshape(N)
+    streams_flat = streams.reshape(N)
 
-    if prei_val <= -0.5 and hand <= low_thresh and relief <= 3:
-        return "Low-lying Depressed (Retention Priority)"
-    elif flat_flag and hand <= med_thresh:
-        return "Flat & Pressured (High Flood Exposure Risk)"
-    elif prei_val > 0.5 and hand > 5.0:
-        return "Locally High & Disconnected"
-    else:
-        return "Moderate / Context-Dependent"
+    # Index of downstream cell for each cell (-1 if none)
+    down_index = np.full(N, -1, dtype=np.int32)
+    for r in range(nrows):
+        for c in range(ncols):
+            idx = r * ncols + c
+            if not valid_mask[r, c]:
+                continue
+            code = int(fdir[r, c])
+            if code not in _D8_OFFSETS:
+                continue
+            dr, dc = _D8_OFFSETS[code]
+            nr, nc = r + dr, c + dc
+            if 0 <= nr < nrows and 0 <= nc < ncols and valid_mask[nr, nc]:
+                down_index[idx] = nr * ncols + nc
+
+    # Build upstream adjacency list
+    upstream = [[] for _ in range(N)]
+    for i in range(N):
+        j = down_index[i]
+        if j >= 0:
+            upstream[j].append(i)
+
+    # BFS from streams upstream
+    from collections import deque
+    hand_flat = np.full(N, np.nan, dtype="float32")
+    q = deque()
+
+    for i in range(N):
+        if valid_flat[i] and streams_flat[i]:
+            hand_flat[i] = 0.0
+            q.append(i)
+
+    # propagate upstream
+    while q:
+        j = q.popleft()
+        for i in upstream[j]:
+            if not valid_flat[i]:
+                continue
+            if not np.isnan(hand_flat[i]):
+                continue
+            drop = dem_flat[i] - dem_flat[j]
+            if drop < 0:
+                drop = 0.0
+            hand_flat[i] = hand_flat[j] + drop
+            q.append(i)
+
+    # cells not connected to a stream: treat as 0 HAND
+    mask_unset = np.isnan(hand_flat) & valid_flat
+    hand_flat[mask_unset] = 0.0
+    return hand_flat.reshape(nrows, ncols)
 
 
-def _write_float_raster(arr, meta_template, transform, path):
-    """Write a float32 GeoTIFF from a numpy array using a template profile."""
-    nodata = -9999.0
-    prof = meta_template.copy()
-    prof.update(
-        height=arr.shape[0],
-        width=arr.shape[1],
-        transform=transform,
-        dtype="float32",
-        count=1,
-        nodata=nodata,
-        compress="lzw",
-    )
-    data = arr.astype("float32").copy()
-    data[~np.isfinite(data)] = nodata
-
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with rasterio.open(path, "w", **prof) as dst:
-        dst.write(data, 1)
-    return str(path), nodata
-
-
-# ---------------------------------------------------------------------
-# Main entry point
-# ---------------------------------------------------------------------
-def run_pec_analysis(
+def run_pec_base(
     dem_path: str,
     parcels_path: str,
-    rainfall_mm: float = 0.0,
     prei_radius_m: float = 250.0,
-    hand_radius_m: float = 150.0,
-):
+    stream_threshold: float = 400.0,
+) -> Tuple[gpd.GeoDataFrame, Dict]:
     """
-    Run full PEC workflow for the app (no Whitebox).
+    Run the base PEC workflow (no rainfall adjustment yet).
 
-    Args
-    ----
-    dem_path        : path to DEM (GeoTIFF)
-    parcels_path    : path to parcel grid (GeoJSON / Shapefile)
-    rainfall_mm     : rainfall depth for rainfall-aware PEC.
-                      Set 0 for static PEC.
-    prei_radius_m   : neighbourhood radius for PREI (m)
-    hand_radius_m   : neighbourhood radius for HAND proxy (m)
-
-    Returns
-    -------
-    parcels_pec : GeoDataFrame with PEC indicators and class
-    diagnostics : dict
+    Returns (parcels_gdf, diagnostics).
     """
+    # --- DEM ---
+    with rasterio.open(dem_path) as src:
+        dem = src.read(1).astype("float64")
+        profile = src.profile.copy()
+        transform = src.transform
+        crs = src.crs
+        res_x = src.res[0]
+        nodata = src.nodata
 
-    base_dir = Path(__file__).resolve().parents[1]
-    out_dir = base_dir / "outputs" / "individual" / "pec"
-    out_dir.mkdir(parents=True, exist_ok=True)
+    if nodata is not None:
+        dem = np.where(dem == nodata, np.nan, dem)
+    valid_mask = np.isfinite(dem)
 
-    # ------------------------------------------------------------------
-    # 1. Load parcels & clip DEM to study extent
-    # ------------------------------------------------------------------
+    # --- Parcels ---
     parcels = gpd.read_file(parcels_path)
     if parcels.crs is None:
-        raise ValueError("Parcels layer has no CRS. Please define it and re-save.")
-
-    with rasterio.open(dem_path) as src:
-        dem_crs = src.crs
-        dem_meta = src.meta.copy()
-        # Reproject parcels to DEM CRS and clip extent
-        parcels = parcels.to_crs(dem_crs)
-        boundary_geom = [mapping(parcels.unary_union)]
-        out_image, out_transform = mask(src, boundary_geom, crop=True)
-
-    # DEM array (single band)
-    dem = out_image[0].astype("float64")
-    nodata_val = dem_meta.get("nodata", None)
-
-    if nodata_val is not None:
-        dem = np.where(dem == nodata_val, np.nan, dem)
-    # Remove weird extreme negatives
-    dem = np.where(dem < -1000, np.nan, dem)
-
-    # If everything is NaN, bail out
-    if not np.isfinite(dem).any():
-        raise ValueError("DEM appears empty or all nodata within parcel extent.")
-
-    cellsize = float(abs(out_transform.a))
-
-    # Ensure grid_id
-    parcels = parcels.reset_index(drop=True)
+        raise ValueError("Parcels layer has no CRS.")
+    if parcels.crs != crs:
+        parcels = parcels.to_crs(crs)
     if "grid_id" not in parcels.columns:
-        parcels["grid_id"] = np.arange(1, len(parcels) + 1, dtype="int32")
+        parcels["grid_id"] = np.arange(1, len(parcels) + 1)
 
     grid_gdf = parcels.copy()
 
-    # ------------------------------------------------------------------
-    # 2. Compute slope from DEM
-    # ------------------------------------------------------------------
-    dem_filled = np.where(np.isfinite(dem), dem, np.nanmean(dem))
-    # gradient expects rows=y, cols=x
-    dy, dx = np.gradient(dem_filled, cellsize, cellsize)
-    slope_rad = np.arctan(np.sqrt(dx ** 2 + dy ** 2))
+    # --- Flow routing with pysheds ---
+    grid = Grid.from_raster(dem_path)
+    dem_flow = grid.read_raster(dem_path).astype("float64")
+    dem_flow = np.where(~valid_mask, np.nan, dem_flow)
+
+    dem_filled = grid.fill_depressions(dem_flow)
+    dem_flat = grid.resolve_flats(dem_filled)
+    fdir = grid.flowdir(dem_flat)
+    acc = grid.accumulation(fdir)
+    acc = np.where(~valid_mask, 0.0, acc)
+
+    # --- Slope (degrees) ---
+    cellsize_x = profile["transform"][0]
+    cellsize_y = -profile["transform"][4]
+    gy, gx = np.gradient(dem_filled, cellsize_y, cellsize_x)
+    slope_rad = np.arctan(np.sqrt(gx * gx + gy * gy))
     slope_deg = np.degrees(slope_rad)
-    slope_deg[~np.isfinite(dem)] = np.nan
+    slope_deg[~valid_mask] = np.nan
 
-    # ------------------------------------------------------------------
-    # 3. PREI (DEM - neighbourhood mean)
-    # ------------------------------------------------------------------
-    prei_radius_pix = max(1, int(prei_radius_m / cellsize))
-    prei_kernel = prei_radius_pix * 2 + 1
+    # --- PREI: DEM - neighbourhood mean ---
+    radius_cells = max(1, int(round(prei_radius_m / res_x)))
+    size = radius_cells * 2 + 1
 
-    local_mean = uniform_filter(dem_filled, size=prei_kernel, mode="nearest")
-    prei_grid = dem_filled - local_mean
-    prei_grid[~np.isfinite(dem)] = np.nan
+    valid_float = np.isfinite(dem_filled).astype("float32")
+    dem_zero = np.where(valid_float, dem_filled, 0.0)
 
-    # ------------------------------------------------------------------
-    # 4. HAND proxy (DEM - local minimum)
-    # ------------------------------------------------------------------
-    hand_radius_pix = max(1, int(hand_radius_m / cellsize))
-    hand_kernel = hand_radius_pix * 2 + 1
+    mean_dem = uniform_filter(dem_zero, size=size, mode="nearest")
+    mean_mask = uniform_filter(valid_float, size=size, mode="nearest")
+    with np.errstate(invalid="ignore", divide="ignore"):
+        neigh_mean = np.where(
+            mean_mask > 0,
+            mean_dem / np.maximum(mean_mask, 1e-6),
+            np.nan,
+        )
+    dem_rel = dem_filled - neigh_mean
+    dem_rel[~valid_mask] = np.nan
 
-    local_min = minimum_filter(dem_filled, size=hand_kernel, mode="nearest")
-    hand_grid = dem_filled - local_min
-    hand_grid[hand_grid < 0] = 0.0
-    hand_grid[~np.isfinite(dem)] = np.nan
+    # --- Streams and HAND ---
+    streams = acc >= float(stream_threshold)
+    hand = _compute_hand_from_streams(dem_filled, fdir, streams, valid_mask)
 
-    # ------------------------------------------------------------------
-    # 5. Write intermediate rasters & zonal statistics
-    # ------------------------------------------------------------------
-    dem_clip_path, dem_nodata = _write_float_raster(
-        dem, dem_meta, out_transform, out_dir / "pec_dem_clip.tif"
-    )
-    slope_path, slope_nodata = _write_float_raster(
-        slope_deg, dem_meta, out_transform, out_dir / "pec_slope_deg.tif"
-    )
-    prei_path, prei_nodata = _write_float_raster(
-        prei_grid, dem_meta, out_transform, out_dir / "pec_prei.tif"
-    )
-    hand_path, hand_nodata = _write_float_raster(
-        hand_grid, dem_meta, out_transform, out_dir / "pec_hand_proxy.tif"
-    )
-
-    # DEM stats
+    # --- Parcel zonal stats ---
     dem_stats = zonal_stats(
-        grid_gdf, dem_clip_path, stats=["min", "max", "mean"], nodata=dem_nodata
+        grid_gdf,
+        dem_filled,
+        affine=transform,
+        stats=["min", "max", "mean", "median", "std"],
+        nodata=np.nan,
     )
+    slope_stats = zonal_stats(
+        grid_gdf,
+        slope_deg,
+        affine=transform,
+        stats=["mean", "median"],
+        nodata=np.nan,
+    )
+    rel_stats = zonal_stats(
+        grid_gdf,
+        dem_rel,
+        affine=transform,
+        stats=["mean", "min", "max"],
+        nodata=np.nan,
+    )
+    hand_stats = zonal_stats(
+        grid_gdf,
+        hand,
+        affine=transform,
+        stats=["min", "mean"],
+        nodata=np.nan,
+    )
+
     grid_gdf["dem_min"] = [d["min"] for d in dem_stats]
     grid_gdf["dem_max"] = [d["max"] for d in dem_stats]
     grid_gdf["dem_mean"] = [d["mean"] for d in dem_stats]
+    grid_gdf["dem_median"] = [d["median"] for d in dem_stats]
+    grid_gdf["dem_std"] = [d["std"] for d in dem_stats]
 
-    # Relief
-    grid_gdf["relief"] = grid_gdf["dem_max"] - grid_gdf["dem_min"]
+    grid_gdf["slp_mean"] = [d["mean"] for d in slope_stats]
+    grid_gdf["slp_median"] = [d["median"] for d in slope_stats]
 
-    # Slope stats
-    slp_stats = zonal_stats(
-        grid_gdf, slope_path, stats=["mean"], nodata=slope_nodata
-    )
-    grid_gdf["slp_mean"] = [d["mean"] for d in slp_stats]
-    grid_gdf["flat_flag"] = grid_gdf["slp_mean"] < 1.5
+    grid_gdf["rel_mean"] = [d["mean"] for d in rel_stats]
+    grid_gdf["rel_min"] = [d["min"] for d in rel_stats]
+    grid_gdf["rel_max"] = [d["max"] for d in rel_stats]
 
-    # PREI stats (relative elevation)
-    prei_stats = zonal_stats(
-        grid_gdf, prei_path, stats=["mean", "min", "max"], nodata=prei_nodata
-    )
-    grid_gdf["rel_mean"] = [d["mean"] for d in prei_stats]
-    grid_gdf["rel_min"] = [d["min"] for d in prei_stats]
-    grid_gdf["rel_max"] = [d["max"] for d in prei_stats]
-
-    # HAND proxy stats
-    hand_stats = zonal_stats(
-        grid_gdf, hand_path, stats=["min", "mean"], nodata=hand_nodata
-    )
     grid_gdf["hand_min"] = [d["min"] for d in hand_stats]
     grid_gdf["hand_mean"] = [d["mean"] for d in hand_stats]
 
-    # PREI index & hand_score (align with your earlier naming)
+    # --- Derived indicators ("static" PEC) ---
+    grid_gdf["relief"] = grid_gdf["dem_max"] - grid_gdf["dem_min"]
+    grid_gdf["flat_flag"] = grid_gdf["slp_mean"] < 1.5
     grid_gdf["prei"] = grid_gdf["rel_mean"]
     grid_gdf["hand_score"] = grid_gdf["hand_min"]
-
-    # Fill NaNs to avoid weird comparisons in classification
+    grid_gdf["retain_tag"] = np.where(
+        (grid_gdf["prei"] <= -0.5) & (grid_gdf["hand_score"] <= 1.5),
+        1,
+        0,
+    )
     cols_to_fill = ["prei", "hand_score", "relief", "slp_mean"]
-    grid_gdf[cols_to_fill] = grid_gdf[cols_to_fill].fillna(0.0)
-
-    # ------------------------------------------------------------------
-    # 6. PEC classification (static or rainfall-aware)
-    # ------------------------------------------------------------------
-    if rainfall_mm is None or rainfall_mm <= 0:
-        pec_classes = grid_gdf.apply(_classify_pec_static, axis=1)
-    else:
-        pec_classes = grid_gdf.apply(
-            lambda r: _classify_pec_rainfall(r, rainfall_mm=rainfall_mm),
-            axis=1,
-        )
-
-    grid_gdf["pec_class"] = pec_classes
-
-    pec_mapping = {
-        "Low-lying Depressed (Retention Priority)": 1,
-        "Flat & Pressured (High Flood Exposure Risk)": 2,
-        "Locally High & Disconnected": 3,
-        "Moderate / Context-Dependent": 4,
-    }
-    grid_gdf["pec_code"] = grid_gdf["pec_class"].map(pec_mapping).astype("Int32")
-
-    # Some normalized helper indices if you want later plots
-    grid_gdf["prei_norm"] = _minmax(grid_gdf["prei"].values)
-    grid_gdf["hand_norm"] = _minmax(grid_gdf["hand_score"].values)
+    grid_gdf[cols_to_fill] = grid_gdf[cols_to_fill].fillna(0)
 
     diagnostics = {
-        "n_parcels": int(len(grid_gdf)),
-        "dem_res_m": float(cellsize),
-        "prei_radius_m": float(prei_radius_m),
-        "hand_radius_m": float(hand_radius_m),
-        "prei_radius_pixels": int(prei_radius_pix),
-        "hand_radius_pixels": int(hand_radius_pix),
-        "rainfall_mm": float(rainfall_mm),
-        "pec_class_counts": grid_gdf["pec_class"].value_counts().to_dict(),
-    }
-
-    return grid_gdf, diagnostics
+        "n_parc
