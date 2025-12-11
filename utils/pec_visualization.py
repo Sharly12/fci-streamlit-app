@@ -3,7 +3,7 @@
 import folium
 import geopandas as gpd
 
-# Fixed colour scheme – matches your original Matplotlib map
+# Fixed colour scheme – matches your original Matplotlib PEC map
 PEC_COLORS = {
     "Low-lying Depressed (Retention Priority)": "#2166ac",   # blue
     "Flat & Pressured (High Flood Exposure Risk)": "#b2182b", # red
@@ -16,24 +16,37 @@ def build_pec_map(parcels_gdf: gpd.GeoDataFrame, rainfall_label=None):
     """
     Build an interactive PEC map (Folium) with the same colours as the
     original PEC plots.
+
+    Parameters
+    ----------
+    parcels_gdf : GeoDataFrame
+        Output of run_pec_analysis(), must contain 'pec_class' and 'grid_id'.
+    rainfall_label : float or None
+        Optional number to show in the legend title (e.g. reference rainfall).
     """
     if parcels_gdf.crs is None:
-        raise ValueError("PEC parcels must have a CRS.")
+        raise ValueError("PEC parcels must have a CRS defined.")
 
+    # Reproject to WGS84 for web mapping
     parcels_wgs = parcels_gdf.to_crs(epsg=4326)
     centroid = parcels_wgs.geometry.unary_union.centroid
 
     if rainfall_label is None:
         title = "Parcel-level PEC classification"
     else:
-        title = f"Parcel-level PEC classification (reference rainfall {rainfall_label:.0f} mm/h)"
+        title = (
+            f"Parcel-level PEC classification<br>"
+            f"(reference rainfall {rainfall_label:.0f} mm/h)"
+        )
 
+    # Base map
     m = folium.Map(
         location=[centroid.y, centroid.x],
         zoom_start=13,
         tiles="OpenStreetMap",
     )
 
+    # Style function using fixed colour palette
     def style_function(feature):
         cls = feature["properties"].get("pec_class", "Moderate / Context-Dependent")
         color = PEC_COLORS.get(cls, "#ffffbf")
@@ -55,13 +68,13 @@ def build_pec_map(parcels_gdf: gpd.GeoDataFrame, rainfall_label=None):
         ),
     ).add_to(m)
 
-    # HTML legend
+    # Legend
     legend_html = f"""
     <div style="
         position: fixed;
         bottom: 40px;
         left: 40px;
-        z-index:9999;
+        z-index: 9999;
         background-color: rgba(255,255,255,0.9);
         padding: 8px 10px;
         border-radius: 8px;
@@ -72,12 +85,15 @@ def build_pec_map(parcels_gdf: gpd.GeoDataFrame, rainfall_label=None):
     """
     for label, color in PEC_COLORS.items():
         legend_html += (
-            f'<div><span style="display:inline-block;width:12px;height:12px;'
+            f'<div>'
+            f'<span style="display:inline-block;width:12px;height:12px;'
             f'background:{color};border:1px solid #555;margin-right:4px;"></span>'
-            f'{label}</div>'
+            f'{label}'
+            f'</div>'
         )
     legend_html += "</div>"
 
     m.get_root().html.add_child(folium.Element(legend_html))
     folium.LayerControl().add_to(m)
+
     return m
