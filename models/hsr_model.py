@@ -314,5 +314,14 @@ def run_hsr_analysis(
         "depth_threshold_m": float(dep_threshold) if dep_threshold is not None else None,
         "rainfall_mm": rain,
     }
+   outputs = {
+        "workspace": tmp_dir,
+        "dem_utm_tif": dem_utm_path,
+        "cn_utm_tif": cn_utm_path,
+        "runoff_tif": runoff_path,
+        "hsr_static_tif": hsr_static_path,
+        "hsr_rain_tif": hsr_rain_path,
+    }
 
-    return parcels, diagnostics
+    return parcels, diagnostics, outputs
+
