@@ -2,10 +2,62 @@
 import streamlit as st
 import pandas as pd
 from streamlit_folium import folium_static
+import io
+import zipfile
+from xml.etree.ElementTree import Element, SubElement, tostring
+from shapely.geometry import Polygon, MultiPolygon
+
 
 from utils.data_loader import get_data_paths
 from models.hsr_model import run_hsr_analysis
 from utils.hsr_visualization import build_hsr_map
+
+def gdf_to_kml_bytes(gdf_wgs84, doc_name="HSR Parcels", fields=None) -> bytes:
+    """
+    Convert parcels GeoDataFrame (must be EPSG:4326) to KML bytes.
+    """
+    if fields is None:
+        fields = []
+
+    def coords_to_kml(coords):
+        return " ".join([f"{x},{y},0" for (x, y) in coords])
+
+    def polygon_to_kml(parent, poly: Polygon):
+        poly_el = SubElement(parent, "Polygon")
+        outer = SubElement(SubElement(poly_el, "outerBoundaryIs"), "LinearRing")
+        SubElement(outer, "coordinates").text = coords_to_kml(list(poly.exterior.coords))
+        for ring in poly.interiors:
+            inner = SubElement(SubElement(poly_el, "innerBoundaryIs"), "LinearRing")
+            SubElement(inner, "coordinates").text = coords_to_kml(list(ring.coords))
+
+    kml = Element("kml", xmlns="http://www.opengis.net/kml/2.2")
+    doc = SubElement(kml, "Document")
+    SubElement(doc, "name").text = doc_name
+
+    gdf = gdf_wgs84[gdf_wgs84.geometry.notnull()].copy()
+
+    for idx, row in gdf.iterrows():
+        geom = row.geometry
+        if geom is None or geom.is_empty:
+            continue
+
+        pm = SubElement(doc, "Placemark")
+        SubElement(pm, "name").text = f"Parcel {idx}"
+
+        ext = SubElement(pm, "ExtendedData")
+        for f in fields:
+            if f in row:
+                data_el = SubElement(ext, "Data", name=str(f))
+                SubElement(data_el, "value").text = "" if row[f] is None else str(row[f])
+
+        if isinstance(geom, Polygon):
+            polygon_to_kml(pm, geom)
+        elif isinstance(geom, MultiPolygon):
+            mg = SubElement(pm, "MultiGeometry")
+            for poly in geom.geoms:
+                polygon_to_kml(mg, poly)
+
+    return tostring(kml, encoding="utf-8", xml_declaration=True)
 
 st.title("💧 Hydrological Storage Role (HSR) Analysis")
 
@@ -51,7 +103,7 @@ if run_btn:
         dem_path, parcels_path, cn_path = get_data_paths()
 
         with st.spinner("Running HSR ENGINE v4 …"):
-            parcels_hsr, diagnostics = run_hsr_analysis(
+            parcels_hsr, diagnostics, outputs = run_hsr_analysis(
                 dem_path=dem_path,
                 cn_path=cn_path,
                 parcels_path=parcels_path,
@@ -60,6 +112,67 @@ if run_btn:
             )
 
         st.success("✅ HSR analysis complete")
+        # ------------------------------------------------------------
+        # ✅ Downloads (GeoTIFF + Parcel KML) - using ORIGINAL outputs
+        # ------------------------------------------------------------
+        st.subheader("Downloads")
+
+        # 1) Read GeoTIFF bytes (files already produced by your model)
+        with open(outputs["hsr_static_tif"], "rb") as f:
+            static_bytes = f.read()
+        with open(outputs["hsr_rain_tif"], "rb") as f:
+            rain_bytes = f.read()
+
+        # Optional ZIP for convenience
+        zip_buf = io.BytesIO()
+        with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("HSR_static.tif", static_bytes)
+            zf.writestr("HSR_rain.tif", rain_bytes)
+        zip_bytes = zip_buf.getvalue()
+
+        # 2) Parcel KML (KML must be WGS84 / EPSG:4326)
+        parcels_wgs84 = parcels_hsr.to_crs(epsg=4326)
+        kml_fields = [
+            "HSR_index",
+            "HSR_static_sum", "HSR_static_mean", "HSR_static_max",
+            "HSR_rain_sum", "HSR_rain_mean", "HSR_rain_max",
+            "Rainfall_mm",
+        ]
+        existing_fields = [c for c in kml_fields if c in parcels_wgs84.columns]
+        kml_bytes = gdf_to_kml_bytes(parcels_wgs84, doc_name="HSR Parcels", fields=existing_fields)
+
+        c1, c2, c3 = st.columns(3)
+
+        with c1:
+            st.download_button(
+                "Download HSR_static (GeoTIFF)",
+                data=static_bytes,
+                file_name=f"HSR_static_{int(rainfall_mm)}mm.tif",
+                mime="image/tiff",
+            )
+
+        with c2:
+            st.download_button(
+                "Download HSR_rain (GeoTIFF)",
+                data=rain_bytes,
+                file_name=f"HSR_rain_{int(rainfall_mm)}mm.tif",
+                mime="image/tiff",
+            )
+
+        with c3:
+            st.download_button(
+                "Download both rasters (ZIP)",
+                data=zip_bytes,
+                file_name=f"HSR_rasters_{int(rainfall_mm)}mm.zip",
+                mime="application/zip",
+            )
+
+        st.download_button(
+            "Download parcel layer (KML)",
+            data=kml_bytes,
+            file_name=f"HSR_parcels_{int(rainfall_mm)}mm.kml",
+            mime="application/vnd.google-earth.kml+xml",
+        )
 
         # Diagnostics
         st.subheader("Model diagnostics")
@@ -134,3 +247,4 @@ if run_btn:
         st.exception(e)
 else:
     st.info("Set rainfall and concavity window, then click **Run HSR Analysis**.")
+
