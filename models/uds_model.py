@@ -21,9 +21,11 @@ Pipeline:
 Returns:
     parcels_uds : GeoDataFrame with all metrics
     diagnostics : dict
+    outputs     : dict of exported GeoTIFF paths (ADDED; no analysis changes)
 """
 
 import os
+import tempfile
 import numpy as np
 import geopandas as gpd
 import rasterio
@@ -56,18 +58,11 @@ def run_uds_analysis(
     """
     Run full UDS + CN–runoff analysis.
 
-    Args
-    ----
-    dem_path      : path to DEM raster
-    cn_path       : path to Curve Number raster
-    parcels_path  : path to parcel polygons (GeoJSON / Shapefile / etc.)
-    rainfall_mm   : rainfall depth (mm) used for SCS–CN runoff
-    max_steps     : max D8 steps when tracing flow from pour point
-
     Returns
     -------
     parcels : GeoDataFrame with UDS and runoff metrics
     diagnostics : dict of summary info
+    outputs : dict of GeoTIFF paths (ADDED; no analysis changes)
     """
 
     # --------------------------------------------------------------
@@ -81,6 +76,7 @@ def run_uds_analysis(
         dem_crs = dem_src.crs
         dem_transform = dem_src.transform
         dem_height, dem_width = dem_src.height, dem_src.width
+        dem_profile_base = dem_src.profile.copy()
 
     if str(parcels.crs) != str(dem_crs):
         parcels = parcels.to_crs(dem_crs)
@@ -92,7 +88,7 @@ def run_uds_analysis(
     n_parcels = len(parcels)
 
     # --------------------------------------------------------------
-    # FLOW DIRECTION + ACCUMULATION FROM DEM
+    # FLOW DIRECTION + ACCUMULATION FROM DEM (UNCHANGED)
     # --------------------------------------------------------------
     gridDEM = Grid.from_raster(dem_path)
     dem = gridDEM.read_raster(dem_path)
@@ -102,12 +98,9 @@ def run_uds_analysis(
     acc = gridDEM.accumulation(fdir)
 
     # --------------------------------------------------------------
-    # RASTERIZE PARCELS (grid_id per cell)
+    # RASTERIZE PARCELS (grid_id per cell) (UNCHANGED)
     # --------------------------------------------------------------
-    shapes = (
-        (geom, int(pid))
-        for geom, pid in zip(parcels.geometry, parcels["grid_id"])
-    )
+    shapes = ((geom, int(pid)) for geom, pid in zip(parcels.geometry, parcels["grid_id"]))
 
     parcel_raster = rasterize(
         shapes,
@@ -118,7 +111,7 @@ def run_uds_analysis(
     )
 
     # --------------------------------------------------------------
-    # FIND POUR POINTS (max accumulation cell in each parcel)
+    # FIND POUR POINTS (max accumulation cell in each parcel) (UNCHANGED)
     # --------------------------------------------------------------
     parcel_pour = {}
     for pid in parcels["grid_id"]:
@@ -131,7 +124,7 @@ def run_uds_analysis(
         parcel_pour[int(pid)] = (int(rows[idx]), int(cols[idx]))
 
     # --------------------------------------------------------------
-    # BUILD FLOW GRAPH BETWEEN PARCELS
+    # BUILD FLOW GRAPH BETWEEN PARCELS (UNCHANGED)
     # --------------------------------------------------------------
     d8_to_offset = {
         1: (0, 1),
@@ -169,7 +162,6 @@ def run_uds_analysis(
 
             downstream_pid = int(parcel_raster[nr, nc])
 
-            # Found a downstream parcel different from source
             if downstream_pid != 0 and downstream_pid != pid:
                 G.add_edge(int(pid), int(downstream_pid))
                 break
@@ -177,7 +169,7 @@ def run_uds_analysis(
             cur_r, cur_c = nr, nc
 
     # --------------------------------------------------------------
-    # UDS METRICS
+    # UDS METRICS (UNCHANGED)
     # --------------------------------------------------------------
     parcels["area_m2"] = parcels.geometry.area
     total_area = float(parcels["area_m2"].sum())
@@ -191,14 +183,11 @@ def run_uds_analysis(
         up = nx.ancestors(G, int(pid))
         down = nx.descendants(G, int(pid))
 
-        up_area = float(
-            parcels.loc[parcels["grid_id"].isin(up), "area_m2"].sum()
-        )
+        up_area = float(parcels.loc[parcels["grid_id"].isin(up), "area_m2"].sum())
         up_norm = up_area / total_area if total_area > 0 else 0.0
         down_norm = len(down) / total_cells if total_cells > 0 else 0.0
 
         uds_val = 0.5 * up_norm + 0.5 * down_norm
-
         uds_scores.append(uds_val)
         ups.append(len(up))
         downs.append(len(down))
@@ -209,34 +198,23 @@ def run_uds_analysis(
     parcels["uds_score_norm"] = _minmax_norm(parcels["uds_score"].values)
 
     # --------------------------------------------------------------
-    # CN EXTRACTION VIA ZONAL STATS
+    # CN EXTRACTION VIA ZONAL STATS (UNCHANGED)
     # --------------------------------------------------------------
     with rasterio.open(cn_path) as cn_src:
         cn_crs = cn_src.crs
 
-    if str(parcels.crs) != str(cn_crs):
-        parcels_cn = parcels.to_crs(cn_crs)
-    else:
-        parcels_cn = parcels.copy()
+    parcels_cn = parcels.to_crs(cn_crs) if str(parcels.crs) != str(cn_crs) else parcels.copy()
 
-    zs = zonal_stats(
-        parcels_cn,
-        cn_path,
-        stats=["mean"],
-        nodata=None,
-    )
+    zs = zonal_stats(parcels_cn, cn_path, stats=["mean"], nodata=None)
 
     cn_vals = np.array(
-        [
-            d.get("mean", np.nan) if isinstance(d, dict) else np.nan
-            for d in zs
-        ],
+        [d.get("mean", np.nan) if isinstance(d, dict) else np.nan for d in zs],
         dtype="float64",
     )
     parcels["CN"] = cn_vals
 
     # --------------------------------------------------------------
-    # SCS–CN RUNOFF FOR SELECTED RAINFALL
+    # SCS–CN RUNOFF FOR SELECTED RAINFALL (UNCHANGED)
     # --------------------------------------------------------------
     P = float(rainfall_mm)
     CN = parcels["CN"].values.astype("float64")
@@ -255,7 +233,7 @@ def run_uds_analysis(
     parcels["runoff_norm"] = _minmax_norm(runoff_mm)
 
     # --------------------------------------------------------------
-    # COMBINED UDS × RUNOFF HAZARD INDEX
+    # COMBINED UDS × RUNOFF HAZARD INDEX (UNCHANGED)
     # --------------------------------------------------------------
     uds_down_arr = parcels["uds_down"].values.astype("float64")
     uds_runoff_index = 0.5 * uds_down_arr + 0.5 * parcels["runoff_norm"].values
@@ -265,7 +243,7 @@ def run_uds_analysis(
     parcels["Rainfall_mm"] = P
 
     # --------------------------------------------------------------
-    # DIAGNOSTICS
+    # DIAGNOSTICS (UNCHANGED)
     # --------------------------------------------------------------
     diagnostics = {
         "n_parcels": int(n_parcels),
@@ -277,4 +255,65 @@ def run_uds_analysis(
         "cn_valid_parcels": int(np.isfinite(CN[valid]).sum()),
     }
 
-    return parcels, diagnostics
+    # --------------------------------------------------------------
+    # ✅ EXPORT VISUALIZATION RASTERS (ADDED ONLY; NO ANALYSIS CHANGES)
+    # --------------------------------------------------------------
+    tmp_dir = os.path.join(tempfile.gettempdir(), "uds_engine")
+    os.makedirs(tmp_dir, exist_ok=True)
+
+    base_profile = dem_profile_base.copy()
+    base_profile.update(
+        driver="GTiff",
+        count=1,
+        height=dem_height,
+        width=dem_width,
+        crs=dem_crs,
+        transform=dem_transform,
+        compress="lzw",
+    )
+
+    def _write_tif(path, arr, dtype, nodata):
+        prof = base_profile.copy()
+        prof.update(dtype=dtype, nodata=nodata)
+        with rasterio.open(path, "w", **prof) as dst:
+            dst.write(arr.astype(dtype), 1)
+
+    def _rasterize_metric(values_series, out_dtype="float32", nodata_val=-9999.0):
+        shapes_val = ((geom, float(val)) for geom, val in zip(parcels.geometry, values_series))
+        out = rasterize(
+            shapes_val,
+            out_shape=(dem_height, dem_width),
+            transform=dem_transform,
+            fill=nodata_val,
+            dtype=out_dtype,
+        )
+        return out
+
+    # Paths
+    fdir_path = os.path.join(tmp_dir, "UDS_flow_direction.tif")
+    acc_path = os.path.join(tmp_dir, "UDS_flow_accumulation.tif")
+    parcel_id_path = os.path.join(tmp_dir, "UDS_parcel_id_grid.tif")
+    uds_struct_path = os.path.join(tmp_dir, "UDS_structural_norm.tif")
+    uds_hazard_path = os.path.join(tmp_dir, "UDS_hazard_norm.tif")
+
+    # Write rasters from arrays already computed
+    _write_tif(fdir_path, np.array(fdir), "uint16", 0)
+    _write_tif(acc_path, np.array(acc), "float32", -9999.0)
+    _write_tif(parcel_id_path, parcel_raster, "int32", 0)
+
+    uds_struct_r = _rasterize_metric(parcels["uds_score_norm"].values, out_dtype="float32", nodata_val=-9999.0)
+    uds_hazard_r = _rasterize_metric(parcels["UDS_runoff_norm"].values, out_dtype="float32", nodata_val=-9999.0)
+
+    _write_tif(uds_struct_path, uds_struct_r, "float32", -9999.0)
+    _write_tif(uds_hazard_path, uds_hazard_r, "float32", -9999.0)
+
+    outputs = {
+        "workspace": tmp_dir,
+        "flow_direction_tif": fdir_path,
+        "flow_accumulation_tif": acc_path,
+        "parcel_id_grid_tif": parcel_id_path,
+        "uds_structural_norm_tif": uds_struct_path,
+        "uds_hazard_norm_tif": uds_hazard_path,
+    }
+
+    return parcels, diagnostics, outputs
