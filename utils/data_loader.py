@@ -13,8 +13,7 @@ import streamlit as st
 # Dropbox fallbacks (only used if local files not found)
 # --------------------------------------------------------------------
 DEM_URL = (
-    "https://www.dropbox.com/scl/fi/lrzt81x0d501w948j6etu/"
-    "Dem-demo.tif?rlkey=vyzxwmgo55pqvmem7xyn9emp1&st=j790cjgz&dl=1"
+    "https://www.dropbox.com/scl/fi/xc8lovzfem79wx1i6z8pi/mosaic.tif?rlkey=0fj002ryj0bpsjx6ezit04a3q&st=yskkkq9i&dl=1"
 )
 CN_URL = (
     "https://www.dropbox.com/scl/fi/xfseghib9vg31loxan294/"
