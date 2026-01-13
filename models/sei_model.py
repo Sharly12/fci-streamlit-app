@@ -2,11 +2,18 @@
 # Surrounding Exposure Index (SEI) – parcel-level implementation
 # Area-weighted land-use criticality around each parcel (+ optional hazard)
 
+import os
 import re
+import math
+import tempfile
 import numpy as np
 import pandas as pd
 import geopandas as gpd
 from rasterstats import zonal_stats
+
+import rasterio
+from rasterio.features import rasterize
+from rasterio.transform import from_origin
 
 TIERS = ["Critical", "High", "Medium", "Low", "Very-Low"]
 
@@ -124,25 +131,14 @@ def run_sei_analysis(
     """
     Compute Surrounding Exposure Index (SEI) for each parcel.
 
-    Parameters
-    ----------
-    parcels_path : str
-        Path to parcels (polygons).
-    landuse_path : str
-        Path to land-use polygons.
-    lu_field : str, default 'LU_All'
-        Land-use attribute column to reclassify.
-    buffer_m : float, default 500.0
-        Buffer radius around each parcel (in CRS units, typically meters).
-    hazard_raster : str or None
-        Optional hazard raster (e.g. flood depth). If None: LU-only SEI.
-
     Returns
     -------
     parcels_out : GeoDataFrame
         Parcels with SEI components & SEI score.
     diagnostics : dict
-        Summary diagnostics (tier area totals, unmatched labels, etc.).
+        Summary diagnostics.
+    outputs : dict
+        GeoTIFF export paths (ADDED; no analysis changes).
     """
     # --- Load data ---
     parcels = gpd.read_file(parcels_path)
@@ -289,6 +285,100 @@ def run_sei_analysis(
             if unmatched else [],
     }
 
+    # Drop internal buffer geom
     parcels = parcels.drop(columns=["_buf_geom"])
 
-    return parcels, diagnostics
+    # ------------------------------------------------------------
+    # ✅ EXPORT (ADDED ONLY; DOES NOT CHANGE ANALYSIS)
+    # Rasterize SEI values to a GeoTIFF for visualization/download.
+    # If hazard raster is provided, use it as the reference grid.
+    # Otherwise create a simple grid over parcel bounds.
+    # ------------------------------------------------------------
+    tmp_dir = os.path.join(tempfile.gettempdir(), "sei_engine")
+    os.makedirs(tmp_dir, exist_ok=True)
+
+    sei_tif_path = os.path.join(tmp_dir, "SEI_index.tif")
+
+    nodata = -9999.0
+
+    if hazard_raster:
+        with rasterio.open(hazard_raster) as src:
+            ref_profile = src.profile.copy()
+            ref_transform = src.transform
+            ref_crs = src.crs
+            height = src.height
+            width = src.width
+
+        gdf_ref = parcels.to_crs(ref_crs) if parcels.crs != ref_crs else parcels
+
+        shapes = ((geom, float(val)) for geom, val in zip(gdf_ref.geometry, gdf_ref["SEI"].values))
+        sei_grid = rasterize(
+            shapes=shapes,
+            out_shape=(height, width),
+            transform=ref_transform,
+            fill=nodata,
+            dtype="float32",
+            all_touched=True,
+        )
+
+        out_profile = ref_profile.copy()
+        out_profile.update(
+            driver="GTiff",
+            count=1,
+            dtype="float32",
+            nodata=nodata,
+            compress="lzw",
+        )
+
+        with rasterio.open(sei_tif_path, "w", **out_profile) as dst:
+            dst.write(sei_grid.astype("float32"), 1)
+
+    else:
+        # Create a reference grid over parcels extent
+        bounds = parcels.total_bounds  # minx, miny, maxx, maxy
+        minx, miny, maxx, maxy = map(float, bounds)
+
+        # Choose resolution based on CRS type (export-only choice)
+        try:
+            is_geo = bool(parcels.crs and parcels.crs.is_geographic)
+        except Exception:
+            is_geo = False
+
+        res = 0.00025 if is_geo else 30.0  # ~30m in degrees, or 30m in projected CRS
+        width = max(1, int(math.ceil((maxx - minx) / res)))
+        height = max(1, int(math.ceil((maxy - miny) / res)))
+
+        transform = from_origin(minx, maxy, res, res)
+
+        shapes = ((geom, float(val)) for geom, val in zip(parcels.geometry, parcels["SEI"].values))
+        sei_grid = rasterize(
+            shapes=shapes,
+            out_shape=(height, width),
+            transform=transform,
+            fill=nodata,
+            dtype="float32",
+            all_touched=True,
+        )
+
+        out_profile = {
+            "driver": "GTiff",
+            "height": height,
+            "width": width,
+            "count": 1,
+            "dtype": "float32",
+            "crs": parcels.crs,
+            "transform": transform,
+            "nodata": nodata,
+            "compress": "lzw",
+        }
+
+        with rasterio.open(sei_tif_path, "w", **out_profile) as dst:
+            dst.write(sei_grid.astype("float32"), 1)
+
+    outputs = {
+        "workspace": tmp_dir,
+        "sei_index_tif": sei_tif_path,
+        "hazard_used": bool(hazard_raster),
+    }
+
+    return parcels, diagnostics, outputs
