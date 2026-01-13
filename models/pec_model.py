@@ -15,6 +15,10 @@ It reproduces your logic:
 6. Zonal stats per parcel
 7. PEC indicators + classification into 4 classes
 8. Optional rainfall-adjusted PEC (thresholds modified by rainfall_mm)
+
+✅ Change added (NO analysis change):
+- Return `outputs` dict with GeoTIFF paths so the Streamlit page can download them.
+- Also write a few extra rasters (flow direction / accumulation / streams mask) from arrays already computed.
 """
 
 from pathlib import Path
@@ -95,28 +99,17 @@ def run_pec_analysis(
     """
     Run the full PEC workflow.
 
-    Parameters
-    ----------
-    dem_path : str
-        Path to DEM GeoTIFF (downloaded via get_data_paths / Dropbox).
-    parcels_path : str
-        Path to parcel GeoJSON / Shapefile (grid-network.geojson).
-    rainfall_mm : float
-        Rainfall depth for rainfall-aware PEC (0 = static PEC).
-    neighbourhood_radius_m : float
-        Radius (m) for neighbourhood mean elevation (PREI).
-    stream_threshold : int
-        Flow accumulation (cells) threshold for stream extraction.
-
     Returns
     -------
     parcels_pec : GeoDataFrame
         Parcels with PEC indicators and 'pec_class' string + 'pec_code' int.
     diagnostics : dict
         Basic diagnostic info (counts, thresholds, etc.).
+    outputs : dict
+        Paths to GeoTIFF outputs (added for download; no analysis change).
     """
 
-    # Where to drop intermediate rasters (optional, mainly for debugging)
+    # Where to drop intermediate rasters (optional, mainly for debugging + downloads)
     base_dir = Path(__file__).resolve().parents[1]
     out_dir = base_dir / "outputs" / "individual" / "pec"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -334,6 +327,28 @@ def run_pec_analysis(
     with rasterio.open(hand_path, "w", **hand_profile) as dst:
         dst.write(hand_out, 1)
 
+    # ✅ ADDED ONLY: write flow direction / accumulation / streams mask rasters (no analysis change)
+    fdir_path = out_dir / "flow_direction.tif"
+    acc_path = out_dir / "flow_accumulation.tif"
+    streams_path = out_dir / "streams_mask.tif"
+
+    fdir_profile = base_profile.copy()
+    fdir_profile.update(dtype="uint16", nodata=0, count=1, compress="lzw")
+    with rasterio.open(fdir_path, "w", **fdir_profile) as dst:
+        dst.write(np.array(fdir).astype("uint16"), 1)
+
+    acc_profile = base_profile.copy()
+    acc_profile.update(dtype="float32", nodata=-9999.0, count=1, compress="lzw")
+    acc_arr = np.array(acc).astype("float32")
+    acc_arr[~np.isfinite(acc_arr)] = acc_profile["nodata"]
+    with rasterio.open(acc_path, "w", **acc_profile) as dst:
+        dst.write(acc_arr, 1)
+
+    streams_profile = base_profile.copy()
+    streams_profile.update(dtype="uint8", nodata=0, count=1, compress="lzw")
+    with rasterio.open(streams_path, "w", **streams_profile) as dst:
+        dst.write(stream_mask.astype("uint8"), 1)
+
     # HAND stats
     hand_stats = zonal_stats(
         grid_gdf, str(hand_path), stats=["min", "mean"], nodata=hand_profile["nodata"]
@@ -386,4 +401,18 @@ def run_pec_analysis(
         "pec_class_counts": grid_gdf["pec_class"].value_counts().to_dict(),
     }
 
-    return grid_gdf, diagnostics
+    # ✅ ADDED ONLY: paths for downloading outputs (no analysis change)
+    outputs = {
+        "workspace": str(out_dir),
+        "dem_clipped_tif": str(dem_clipped_path),
+        "dem_filled_tif": str(dem_filled_path),
+        "slope_deg_tif": str(slope_path),
+        "dem_mean_tif": str(dem_mean_path),
+        "prei_tif": str(dem_rel_path),
+        "hand_tif": str(hand_path),
+        "flow_direction_tif": str(fdir_path),
+        "flow_accumulation_tif": str(acc_path),
+        "streams_mask_tif": str(streams_path),
+    }
+
+    return grid_gdf, diagnostics, outputs
