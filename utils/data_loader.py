@@ -13,7 +13,7 @@ import streamlit as st
 # Dropbox fallbacks (only used if local files not found)
 # --------------------------------------------------------------------
 DEM_URL = (
-    "https://www.dropbox.com/scl/fi/xc8lovzfem79wx1i6z8pi/mosaic.tif?rlkey=0fj002ryj0bpsjx6ezit04a3q&st=yskkkq9i&dl=1"
+    "https://www.dropbox.com/scl/fi/xc8lovzfem79wx1i6z8pi/mosaic.tif?rlkey=0fj002ryj0bpsjx6ezit04a3q&st=yskkkq9i&dl=0"
 )
 CN_URL = (
     "https://www.dropbox.com/scl/fi/xfseghib9vg31loxan294/"
@@ -182,3 +182,4 @@ def load_base_data(DEM_PATH_IN, PARCELS_PATH, CN_RASTER_PATH):
         "width": width,
         "parcels": parcels,
     }
+
