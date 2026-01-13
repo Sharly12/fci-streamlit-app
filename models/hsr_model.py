@@ -1,305 +1,267 @@
-# pages/1_HSR_Analysis.py
+# models/hsr_model.py
 import os
-import io
-import zipfile
 import tempfile
-from xml.etree.ElementTree import Element, SubElement, tostring
-
-import streamlit as st
-import pandas as pd
-from shapely.geometry import Polygon, MultiPolygon
-from streamlit_folium import folium_static
-
-from utils.data_loader import get_data_paths
-from models.hsr_model import run_hsr_analysis
-from utils.hsr_visualization import build_hsr_map
+import numpy as np
+import geopandas as gpd
+import rasterio
+from rasterio.warp import reproject, Resampling, calculate_default_transform
+from pysheds.grid import Grid
+from scipy import ndimage
+from scipy.ndimage import grey_closing
+from rasterstats import zonal_stats
 
 
-def gdf_to_kml_bytes(gdf_wgs84, doc_name="HSR Parcels", fields=None) -> bytes:
-    """
-    Convert a parcels GeoDataFrame (must be EPSG:4326) to KML bytes.
-    Writes selected fields into ExtendedData.
-    """
-    if fields is None:
-        fields = []
-
-    def _coords_to_kml(coords):
-        return " ".join([f"{x},{y},0" for (x, y) in coords])
-
-    def _polygon_to_kml(parent, poly: Polygon):
-        poly_el = SubElement(parent, "Polygon")
-
-        outer = SubElement(SubElement(poly_el, "outerBoundaryIs"), "LinearRing")
-        SubElement(outer, "coordinates").text = _coords_to_kml(list(poly.exterior.coords))
-
-        for ring in poly.interiors:
-            inner = SubElement(SubElement(poly_el, "innerBoundaryIs"), "LinearRing")
-            SubElement(inner, "coordinates").text = _coords_to_kml(list(ring.coords))
-
-    kml = Element("kml", xmlns="http://www.opengis.net/kml/2.2")
-    doc = SubElement(kml, "Document")
-    SubElement(doc, "name").text = doc_name
-
-    gdf = gdf_wgs84[gdf_wgs84.geometry.notnull()].copy()
-
-    for idx, row in gdf.iterrows():
-        geom = row.geometry
-        if geom is None or geom.is_empty:
-            continue
-
-        pm = SubElement(doc, "Placemark")
-        SubElement(pm, "name").text = f"Parcel {idx}"
-
-        ext = SubElement(pm, "ExtendedData")
-        for f in fields:
-            if f in row:
-                data_el = SubElement(ext, "Data", name=str(f))
-                SubElement(data_el, "value").text = "" if row[f] is None else str(row[f])
-
-        if isinstance(geom, Polygon):
-            _polygon_to_kml(pm, geom)
-        elif isinstance(geom, MultiPolygon):
-            mg = SubElement(pm, "MultiGeometry")
-            for poly in geom.geoms:
-                _polygon_to_kml(mg, poly)
-
-    return tostring(kml, encoding="utf-8", xml_declaration=True)
+def _load_raster(path):
+    """Read a single-band raster as float64 + profile, respecting nodata."""
+    with rasterio.open(path) as src:
+        arr = src.read(1).astype("float64")
+        prof = src.profile
+        nodata = src.nodata
+        if nodata is not None:
+            arr = np.where(arr == nodata, np.nan, arr)
+    return arr, prof
 
 
-st.title("💧 Hydrological Storage Role (HSR) Analysis")
-
-st.write(
-    """
-The Hydrological Storage Role (HSR) model estimates how much water can be
-stored in local topographic concavities (HSR_static) and how much of that
-storage is effectively used under a given storm depth (HSR_rain).
-Results are reported at parcel level.
-"""
-)
-
-# ------------------------------------------------------------------
-# Sidebar controls (same as your original)
-# ------------------------------------------------------------------
-with st.sidebar:
-    st.header("HSR Parameters")
-
-    rainfall_mm = st.slider(
-        "Design rainfall (mm)",
-        min_value=0.0,
-        max_value=250.0,
-        value=100.0,
-        step=5.0,
+def _save_raster(arr, profile, out_path):
+    """Save float raster with NaN as nodata."""
+    prof = profile.copy()
+    prof.update(
+        dtype="float32",
+        count=1,
+        nodata=np.nan,
+        compress="deflate",
     )
+    with rasterio.open(out_path, "w", **prof) as dst:
+        dst.write(arr.astype("float32"), 1)
 
-    concavity_window = st.slider(
-        "Concavity window (cells)",
-        min_value=3,
-        max_value=15,
-        value=7,
-        step=2,
-        help="Neighbourhood size (e.g. 7×7 cells ≈ 210 m at 30 m resolution).",
-    )
 
-    if st.button("Clear results"):
-        for k in ["hsr_parcels", "hsr_diag", "hsr_outputs", "hsr_rainfall_mm"]:
-            st.session_state.pop(k, None)
-        st.rerun()
-
-run_btn = st.button("Run HSR Analysis")
-
-# ------------------------------------------------------------------
-# Run the model (NO change to analysis; only store outputs for download)
-# ------------------------------------------------------------------
-if run_btn:
-    try:
-        dem_path, parcels_path, cn_path = get_data_paths()
-
-        with st.spinner("Running HSR ENGINE v4 …"):
-            # ✅ Backward/forward compatible:
-            # - if your model returns 2 values (old): (parcels, diagnostics)
-            # - if it returns 3 values (new): (parcels, diagnostics, outputs)
-            try:
-                parcels_hsr, diagnostics, outputs = run_hsr_analysis(
-                    dem_path=dem_path,
-                    cn_path=cn_path,
-                    parcels_path=parcels_path,
-                    rainfall_mm=rainfall_mm,
-                    concavity_window=concavity_window,
-                )
-            except ValueError:
-                parcels_hsr, diagnostics = run_hsr_analysis(
-                    dem_path=dem_path,
-                    cn_path=cn_path,
-                    parcels_path=parcels_path,
-                    rainfall_mm=rainfall_mm,
-                    concavity_window=concavity_window,
-                )
-                # fallback: your original code writes to this workspace with fixed names
-                tmp_dir = os.path.join(tempfile.gettempdir(), "hsr_engine")
-                outputs = {
-                    "workspace": tmp_dir,
-                    "hsr_static_tif": os.path.join(tmp_dir, "HSR_static.tif"),
-                    "hsr_rain_tif": os.path.join(tmp_dir, "HSR_rain.tif"),
-                }
-
-        # Store so downloads stay visible after reruns
-        st.session_state["hsr_parcels"] = parcels_hsr
-        st.session_state["hsr_diag"] = diagnostics
-        st.session_state["hsr_outputs"] = outputs
-        st.session_state["hsr_rainfall_mm"] = float(rainfall_mm)
-
-        st.success("✅ HSR analysis complete")
-
-    except Exception as e:
-        st.error("HSR analysis failed. Please check the logs.")
-        st.exception(e)
-
-# ------------------------------------------------------------------
-# Show results + downloads (works even after reruns)
-# ------------------------------------------------------------------
-if "hsr_parcels" in st.session_state:
-    parcels_hsr = st.session_state["hsr_parcels"]
-    diagnostics = st.session_state["hsr_diag"]
-    outputs = st.session_state["hsr_outputs"]
-    rr = int(st.session_state.get("hsr_rainfall_mm", 0))
-
-    # -----------------------------
-    # Downloads
-    # -----------------------------
-    st.subheader("Downloads")
-
-    static_path = outputs.get("hsr_static_tif")
-    rain_path = outputs.get("hsr_rain_tif")
-
-    static_bytes = None
-    rain_bytes = None
-
-    if static_path and os.path.exists(static_path):
-        with open(static_path, "rb") as f:
-            static_bytes = f.read()
-    else:
-        st.warning(f"HSR_static GeoTIFF not found at: {static_path}")
-
-    if rain_path and os.path.exists(rain_path):
-        with open(rain_path, "rb") as f:
-            rain_bytes = f.read()
-    else:
-        st.warning(f"HSR_rain GeoTIFF not found at: {rain_path}")
-
-    c1, c2, c3 = st.columns(3)
-
-    with c1:
-        if static_bytes:
-            st.download_button(
-                "Download HSR_static (GeoTIFF)",
-                data=static_bytes,
-                file_name=f"HSR_static_{rr}mm.tif",
-                mime="image/tiff",
-            )
-
-    with c2:
-        if rain_bytes:
-            st.download_button(
-                "Download HSR_rain (GeoTIFF)",
-                data=rain_bytes,
-                file_name=f"HSR_rain_{rr}mm.tif",
-                mime="image/tiff",
-            )
-
-    with c3:
-        if static_bytes and rain_bytes:
-            zip_buf = io.BytesIO()
-            with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-                zf.writestr("HSR_static.tif", static_bytes)
-                zf.writestr("HSR_rain.tif", rain_bytes)
-            st.download_button(
-                "Download both rasters (ZIP)",
-                data=zip_buf.getvalue(),
-                file_name=f"HSR_rasters_{rr}mm.zip",
-                mime="application/zip",
-            )
-
-    # Parcel KML (always generated from parcel results)
-    parcels_wgs84 = parcels_hsr.to_crs(epsg=4326)
-    kml_fields = [
-        "HSR_index",
-        "HSR_static_sum", "HSR_static_mean", "HSR_static_max",
-        "HSR_rain_sum", "HSR_rain_mean", "HSR_rain_max",
-        "Rainfall_mm",
-    ]
-    existing_fields = [c for c in kml_fields if c in parcels_wgs84.columns]
-    kml_bytes = gdf_to_kml_bytes(parcels_wgs84, doc_name="HSR Parcels", fields=existing_fields)
-
-    st.download_button(
-        "Download parcel HSR layer (KML)",
-        data=kml_bytes,
-        file_name=f"HSR_parcels_{rr}mm.kml",
-        mime="application/vnd.google-earth.kml+xml",
-    )
-
-    # -----------------------------
-    # Diagnostics (unchanged)
-    # -----------------------------
-    st.subheader("Model diagnostics")
-    d1, d2, d3 = st.columns(3)
-    with d1:
-        st.metric("Rainfall (mm)", f"{diagnostics['rainfall_mm']:.0f}")
-        st.metric("Concavity window (cells)", diagnostics["concavity_window"])
-    with d2:
-        st.metric("Cell size (m)", f"{diagnostics['cell_size_m']:.1f}")
-        st.metric("Cell area (m²)", f"{diagnostics['cell_area_m2']:.1f}")
-    with d3:
-        st.metric("Concavity patches", diagnostics["n_concavities"])
-        thresh = diagnostics.get("depth_threshold_m")
-        st.metric("Depth threshold (m)", f"{thresh:.3f}" if thresh is not None else "N/A")
-
-    # -----------------------------
-    # Interactive map (unchanged)
-    # -----------------------------
-    st.subheader("Interactive HSR Map")
-    hsr_map = build_hsr_map(parcels_hsr, rainfall_mm=rr)
-    folium_static(hsr_map, width=1000, height=600)
-
-    # -----------------------------
-    # Table + CSV (unchanged)
-    # -----------------------------
-    st.subheader("Top 10 parcels by HSR index")
-
-    export_cols = [
-        "HSR_index",
-        "HSR_static_sum",
-        "HSR_rain_sum",
-        "HSR_static_mean",
-        "HSR_rain_mean",
-        "Rainfall_mm",
-    ]
-    export_cols = [c for c in export_cols if c in parcels_hsr.columns]
-
-    table_df = (
-        parcels_hsr[export_cols]
-        .sort_values("HSR_index", ascending=False)
-        .head(10)
-    )
-    st.dataframe(
-        table_df.style.format(
-            {
-                "HSR_index": "{:.3f}",
-                "HSR_static_sum": "{:.0f}",
-                "HSR_rain_sum": "{:.0f}",
-                "HSR_static_mean": "{:.1f}",
-                "HSR_rain_mean": "{:.1f}",
-            }
+def _reproject_raster(src_path, dst_path, target_crs, target_res, resampling=Resampling.bilinear):
+    """Reproject + resample raster to target CRS & resolution."""
+    with rasterio.open(src_path) as src:
+        transform, width, height = calculate_default_transform(
+            src.crs,
+            target_crs,
+            src.width,
+            src.height,
+            *src.bounds,
+            resolution=target_res,
         )
-    )
 
-    export_df = parcels_hsr[export_cols].copy()
-    csv_bytes = export_df.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "Download parcel HSR results (CSV)",
-        data=csv_bytes,
-        file_name=f"HSR_results_{rr}mm.csv",
-        mime="text/csv",
-    )
+        profile = src.profile.copy()
+        profile.update(
+            crs=target_crs,
+            transform=transform,
+            width=width,
+            height=height,
+            nodata=np.nan,
+            dtype="float32",
+            compress="deflate",
+        )
 
-else:
-    st.info("Set rainfall and concavity window, then click **Run HSR Analysis**.")
+        data = src.read(1).astype("float64")
+        if src.nodata is not None:
+            data = np.where(data == src.nodata, np.nan, data)
+
+        dst_data = np.full((height, width), np.nan, dtype="float64")
+
+        reproject(
+            source=data,
+            destination=dst_data,
+            src_transform=src.transform,
+            src_crs=src.crs,
+            dst_transform=transform,
+            dst_crs=target_crs,
+            src_nodata=src.nodata,
+            dst_nodata=np.nan,
+            resampling=resampling,
+        )
+
+        with rasterio.open(dst_path, "w", **profile) as dst:
+            dst.write(dst_data.astype("float32"), 1)
+
+
+def _pick_utm_crs_from_raster(profile):
+    """
+    Pick a UTM CRS based on raster bounds center.
+    - If raster is already projected, keep its CRS
+    - If raster is geographic lon/lat, derive UTM from center longitude/latitude
+    """
+    crs = profile.get("crs", None)
+    transform = profile["transform"]
+    width = profile["width"]
+    height = profile["height"]
+
+    cx = transform.c + (width * transform.a) / 2.0
+    cy = transform.f + (height * transform.e) / 2.0
+
+    if crs is not None and crs.is_projected:
+        return crs
+
+    lon = cx
+    lat = cy
+    utm_zone = int((lon + 180) / 6) + 1
+    epsg = 32600 + utm_zone if lat >= 0 else 32700 + utm_zone
+    return rasterio.crs.CRS.from_epsg(epsg)
+
+
+def _norm(x):
+    x = np.asarray(x, dtype="float64")
+    finite = np.isfinite(x)
+    if finite.sum() == 0:
+        return np.zeros_like(x)
+    mn = np.nanmin(x)
+    mx = np.nanmax(x)
+    if mx - mn < 1e-12:
+        return np.zeros_like(x)
+    y = (x - mn) / (mx - mn)
+    y[~finite] = 0
+    return y
+
+
+def run_hsr_analysis(
+    dem_path: str,
+    cn_path: str,
+    parcels_path: str,
+    rainfall_mm: float = 100.0,
+    concavity_window: int = 7,
+):
+    # TEMP WORKSPACE (same as your original approach)
+    tmp_dir = os.path.join(tempfile.gettempdir(), "hsr_engine")
+    os.makedirs(tmp_dir, exist_ok=True)
+
+    # STEP 1 — Reproject DEM + CN to common UTM grid (30 m)
+    dem_raw, dem_prof_raw = _load_raster(dem_path)
+    target_crs = _pick_utm_crs_from_raster(dem_prof_raw)
+    target_res = 30
+
+    dem_utm_path = os.path.join(tmp_dir, "dem_utm.tif")
+    cn_utm_path = os.path.join(tmp_dir, "cn_utm.tif")
+
+    _reproject_raster(dem_path, dem_utm_path, target_crs, target_res)
+    _reproject_raster(cn_path, cn_utm_path, target_crs, target_res)
+
+    dem, dem_profile = _load_raster(dem_utm_path)
+    cn, _ = _load_raster(cn_utm_path)
+
+    cell_size = dem_profile["transform"][0]
+    cell_area = cell_size * cell_size
+
+    # STEP 2 — prep
+    dem_array = np.array(dem, dtype="float64")
+    dem_nanmask = ~np.isfinite(dem_array)
+    dem_filled = dem_array.copy()
+    dem_filled[dem_nanmask] = np.nanmin(dem_array[np.isfinite(dem_array)])
+
+    # STEP 3 — concavity detection (grey closing)
+    w = int(concavity_window)
+    if w % 2 == 0:
+        w += 1
+
+    closed = grey_closing(dem_filled, size=(w, w))
+    dep_depth = closed - dem_filled
+
+    dep_threshold = 0.01
+    depressions = dep_depth > dep_threshold
+    dep_labels, n_deps = ndimage.label(depressions)
+
+    # STEP 4 — HSR_static
+    if n_deps == 0:
+        storage_volumes = np.array([])
+        HSR_static = np.zeros_like(dem_array, dtype="float64")
+    else:
+        mean_depth = ndimage.mean(dep_depth, dep_labels, index=np.arange(1, n_deps + 1))
+        mean_depth = np.array(mean_depth, dtype="float64")
+
+        pixels = ndimage.sum(np.ones_like(dep_depth), dep_labels, index=np.arange(1, n_deps + 1))
+        pixels = np.array(pixels, dtype="float64")
+
+        storage_volumes = mean_depth * pixels * cell_area
+
+        HSR_static = np.zeros_like(dem_array, dtype="float64")
+        for dep_id, vol in enumerate(storage_volumes, start=1):
+            HSR_static[dep_labels == dep_id] = vol
+
+    hsr_static_path = os.path.join(tmp_dir, "HSR_static.tif")
+    _save_raster(HSR_static, dem_profile, hsr_static_path)
+
+    # STEP 5 — runoff (SCS–CN)
+    rain = float(rainfall_mm)
+    CN = np.where((cn > 0) & np.isfinite(cn), cn, np.nan)
+
+    S = (25400.0 / CN) - 254.0
+    Ia = 0.2 * S
+    Q = np.where(rain > Ia, ((rain - Ia) ** 2) / (rain + 0.8 * S), 0.0)
+    runoff = np.where(np.isfinite(Q), Q, 0.0)
+
+    runoff_path = os.path.join(tmp_dir, "runoff_weights.tif")
+    _save_raster(runoff, dem_profile, runoff_path)
+
+    # STEP 6 — weighted flow accumulation
+    grid = Grid.from_raster(dem_utm_path, data_name="dem")
+    dem_flat = grid.read_raster(dem_utm_path)
+
+    runoff_grid = grid.read_raster(runoff_path)
+    fdir = grid.flowdir(dem_flat)
+    wacc = grid.accumulation(fdir, weights=runoff_grid)
+    wacc_array = np.array(wacc, dtype="float64")
+
+    # STEP 7 — HSR_rain
+    if n_deps == 0:
+        HSR_rain_map = np.zeros_like(dem_array, dtype="float64")
+    else:
+        inflow_mm = ndimage.maximum(wacc_array, dep_labels, index=np.arange(1, n_deps + 1))
+        inflow_volumes = inflow_mm * cell_area / 1000.0
+        HSR_rain = np.minimum(storage_volumes, inflow_volumes)
+
+        HSR_rain_map = np.zeros_like(dem_array, dtype="float64")
+        for dep_id, val in enumerate(HSR_rain, start=1):
+            HSR_rain_map[dep_labels == dep_id] = val
+
+    hsr_rain_path = os.path.join(tmp_dir, "HSR_rain.tif")
+    _save_raster(HSR_rain_map, dem_profile, hsr_rain_path)
+
+    # STEP 8 — parcel zonal stats
+    parcels = gpd.read_file(parcels_path)
+    if parcels.crs is None:
+        raise ValueError("Parcels layer has no CRS defined. Please assign a CRS.")
+
+    parcels_utm = parcels.to_crs(dem_profile["crs"])
+
+    zs_static = zonal_stats(parcels_utm, hsr_static_path, stats=["sum", "mean", "max"], nodata=np.nan)
+    zs_rain = zonal_stats(parcels_utm, hsr_rain_path, stats=["sum", "mean", "max"], nodata=np.nan)
+
+    parcels["HSR_static_sum"] = [d.get("sum", 0.0) for d in zs_static]
+    parcels["HSR_static_mean"] = [d.get("mean", 0.0) for d in zs_static]
+    parcels["HSR_static_max"] = [d.get("max", 0.0) for d in zs_static]
+
+    parcels["HSR_rain_sum"] = [d.get("sum", 0.0) for d in zs_rain]
+    parcels["HSR_rain_mean"] = [d.get("mean", 0.0) for d in zs_rain]
+    parcels["HSR_rain_max"] = [d.get("max", 0.0) for d in zs_rain]
+
+    parcels["Rainfall_mm"] = rain
+
+    parcels["HSR_static_norm"] = _norm(parcels["HSR_static_sum"].values)
+    parcels["HSR_rain_norm"] = _norm(parcels["HSR_rain_sum"].values)
+    parcels["HSR_index"] = 0.5 * parcels["HSR_static_norm"] + 0.5 * parcels["HSR_rain_norm"]
+
+    diagnostics = {
+        "utm_crs": str(dem_profile["crs"]),
+        "cell_size_m": float(cell_size),
+        "cell_area_m2": float(cell_area),
+        "n_concavities": int(n_deps),
+        "concavity_window": int(concavity_window),
+        "depth_threshold_m": float(dep_threshold) if dep_threshold is not None else None,
+        "rainfall_mm": rain,
+    }
+
+    # ✅ Option B addition: expose the GeoTIFF paths your code already writes
+    outputs = {
+        "workspace": tmp_dir,
+        "dem_utm_tif": dem_utm_path,
+        "cn_utm_tif": cn_utm_path,
+        "runoff_tif": runoff_path,
+        "hsr_static_tif": hsr_static_path,
+        "hsr_rain_tif": hsr_rain_path,
+    }
+
+    return parcels, diagnostics, outputs
