@@ -1,23 +1,17 @@
 # models/pec_model.py
 """
-Parcel Elevation Context (PEC) model – pysheds-based (no WhiteboxTools).
+PEC model (Parcel Elevation Context) for Streamlit app.
 
-This is a function-style version of your PEC workflow, designed for use
-inside the Streamlit app.
-
-It reproduces your logic:
-
-1. Clip DEM to parcel extent
-2. DEM conditioning (fill pits/depressions, resolve flats) with pysheds
-3. Slope (degrees) from gradients
-4. Local relative elevation (PREI = DEM − neighbourhood mean, ~250 m window)
-5. HAND-like score via flow direction, accumulation & stream mask
-6. Zonal stats per parcel
-7. PEC indicators + classification into 4 classes
-8. Optional rainfall-adjusted PEC (thresholds modified by rainfall_mm)
+Key fixes/features:
+- Automatically ensures DEM processing happens in a METRIC CRS (meters).
+  This fixes slope/PREI/HAND calculations when DEM is in degrees (EPSG:4326).
+- Writes ALL intermediate/output GeoTIFFs to outputs/individual/pec
+- Exports parcel-level KML (fallback GeoJSON if KML driver missing)
+- Returns diagnostics including file paths for easy ZIP download in the UI
 """
 
 from pathlib import Path
+import os
 import numpy as np
 import geopandas as gpd
 import rasterio
@@ -30,34 +24,29 @@ from scipy.ndimage import uniform_filter
 import pandas as pd
 
 
-# Default processing CRS (metric). Matches your original PEC script.
 DEFAULT_METRIC_EPSG = 5234
 
 
+# ---------------------------------------------------------------------
+# CRS / raster helpers
+# ---------------------------------------------------------------------
 def _pick_metric_crs(parcels_crs, dem_crs):
-    """Choose a metric (projected, metres) CRS for slope/PREI/HAND calculations."""
-    if parcels_crs is not None and parcels_crs.is_projected:
+    """Pick a projected CRS (meters). Prefer parcels CRS if projected; else DEM CRS if projected; else EPSG:5234."""
+    if parcels_crs is not None and getattr(parcels_crs, "is_projected", False):
         return parcels_crs
-    if dem_crs is not None and dem_crs.is_projected:
+    if dem_crs is not None and getattr(dem_crs, "is_projected", False):
         return dem_crs
     return rasterio.crs.CRS.from_epsg(DEFAULT_METRIC_EPSG)
 
 
-def _reproject_raster(
-    src_path: Path,
-    dst_path: Path,
-    dst_crs: rasterio.crs.CRS,
-    resampling: Resampling = Resampling.bilinear,
-):
-    """Reproject a single-band GeoTIFF to dst_crs and write to dst_path."""
+def _reproject_raster_singleband(src_path: Path, dst_path: Path, dst_crs, resampling=Resampling.bilinear):
+    """Reproject a single-band GeoTIFF to dst_crs and write."""
     with rasterio.open(src_path) as src:
         if src.crs is None:
             raise ValueError("DEM has no CRS; cannot reproject.")
-
         transform, width, height = calculate_default_transform(
             src.crs, dst_crs, src.width, src.height, *src.bounds
         )
-
         profile = src.profile.copy()
         profile.update(
             crs=dst_crs,
@@ -90,19 +79,18 @@ def _reproject_raster(
     return dst_path
 
 
-# ------------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------------
 def _ensure_grid_id(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
-    """Ensure a 'grid_id' column exists."""
+    """Ensure 'grid_id' exists for parcels."""
     if "grid_id" not in gdf.columns:
         gdf = gdf.copy()
         gdf["grid_id"] = np.arange(1, len(gdf) + 1, dtype="int32")
     return gdf
 
 
+# ---------------------------------------------------------------------
+# Classification rules
+# ---------------------------------------------------------------------
 def _classify_pec_static(row):
-    """Static PEC rules (no rainfall adjustment)."""
     prei = row["prei"]
     hand = row["hand_score"]
     relief = row["relief"]
@@ -119,12 +107,6 @@ def _classify_pec_static(row):
 
 
 def _classify_pec_rainfall(row, rainfall_mm: float):
-    """
-    Rainfall-adjusted PEC rules, matching your script:
-
-    - PREI lowered slightly with rainfall.
-    - HAND thresholds increase with rainfall.
-    """
     prei_val = row["prei"] - 0.002 * rainfall_mm
     hand = row["hand_score"]
     relief = row["relief"]
@@ -143,9 +125,39 @@ def _classify_pec_rainfall(row, rainfall_mm: float):
         return "Moderate / Context-Dependent"
 
 
-# ------------------------------------------------------------------
-# MAIN ENTRY POINT
-# ------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# Raster writers
+# ---------------------------------------------------------------------
+def _write_float_tif(path: Path, arr: np.ndarray, profile: dict, nodata=-9999.0):
+    prof = profile.copy()
+    prof.update(dtype="float32", nodata=float(nodata), count=1, compress="lzw")
+    out = arr.astype("float32")
+    out[~np.isfinite(out)] = prof["nodata"]
+    with rasterio.open(path, "w", **prof) as dst:
+        dst.write(out, 1)
+
+
+def _write_int_tif(path: Path, arr: np.ndarray, profile: dict, dtype="int32", nodata_val=-9999):
+    prof = profile.copy()
+    prof.update(dtype=dtype, nodata=nodata_val, count=1, compress="lzw")
+    out = arr.astype(dtype)
+    out[~np.isfinite(out)] = nodata_val
+    with rasterio.open(path, "w", **prof) as dst:
+        dst.write(out, 1)
+
+
+def _write_uint8_tif(path: Path, arr: np.ndarray, profile: dict, nodata_val=0):
+    prof = profile.copy()
+    prof.update(dtype="uint8", nodata=nodata_val, count=1, compress="lzw")
+    out = arr.astype("uint8")
+    out[~np.isfinite(out)] = nodata_val
+    with rasterio.open(path, "w", **prof) as dst:
+        dst.write(out, 1)
+
+
+# ---------------------------------------------------------------------
+# Main model entry
+# ---------------------------------------------------------------------
 def run_pec_analysis(
     dem_path: str,
     parcels_path: str,
@@ -154,116 +166,99 @@ def run_pec_analysis(
     stream_threshold: int = 400,
 ):
     """
-    Run the full PEC workflow.
-
-    Returns
-    -------
-    parcels_pec : GeoDataFrame
-    diagnostics : dict
+    Run PEC and return (GeoDataFrame, diagnostics).
     """
-
-    # Where to drop intermediate rasters (optional, mainly for debugging)
     base_dir = Path(__file__).resolve().parents[1]
     out_dir = base_dir / "outputs" / "individual" / "pec"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # --------------------------------------------------------------
-    # 0. Load parcels & clip DEM to their extent
-    # --------------------------------------------------------------
     parcels = gpd.read_file(parcels_path)
     if parcels.crs is None:
-        raise ValueError("Parcels layer has no CRS; please define CRS and re-save.")
+        raise ValueError("Parcels layer has no CRS. Please define CRS and re-save.")
 
+    # --------------------------------------------------------------
+    # 1) Clip DEM to parcels in DEM CRS first
+    # --------------------------------------------------------------
     with rasterio.open(dem_path) as src:
         if src.crs is None:
-            raise ValueError("DEM has no CRS; please define CRS before running PEC.")
+            raise ValueError("DEM has no CRS. Please define CRS before running PEC.")
 
         dem_crs_in = src.crs
         dem_meta_in = src.meta.copy()
 
-        # Choose a metric CRS so DEM resolution + slope are in metres (critical).
+        # Select metric CRS for processing
         metric_crs = _pick_metric_crs(parcels.crs, dem_crs_in)
 
-        # Mask DEM to parcels in DEM CRS first (cheap & avoids reprojection of whole DEM).
         parcels_in_dem = parcels.to_crs(dem_crs_in)
         boundary_geom = [mapping(parcels_in_dem.unary_union)]
         out_image, out_transform = mask(src, boundary_geom, crop=True)
 
-    # DEM as float, clean nodata & extreme negatives
-    dem = out_image[0].astype("float64")
+    dem_clip = out_image[0].astype("float64")
     nodata_in = dem_meta_in.get("nodata", None)
     if nodata_in is not None:
-        dem = np.where(dem == nodata_in, np.nan, dem)
-    dem = np.where(dem < -1000, np.nan, dem)
+        dem_clip = np.where(dem_clip == nodata_in, np.nan, dem_clip)
+    dem_clip = np.where(dem_clip < -1000, np.nan, dem_clip)
 
-    if not np.isfinite(dem).any():
-        raise ValueError("DEM is empty or all nodata within the parcel extent.")
+    if not np.isfinite(dem_clip).any():
+        raise ValueError("DEM is empty or all nodata inside parcel extent.")
 
-    # Save clipped DEM (in original DEM CRS)
+    # Save clipped DEM in source CRS
     dem_meta_clip = dem_meta_in.copy()
     dem_meta_clip.update(
-        height=dem.shape[0],
-        width=dem.shape[1],
+        height=dem_clip.shape[0],
+        width=dem_clip.shape[1],
         transform=out_transform,
         dtype="float32",
         count=1,
         nodata=-9999.0,
         compress="lzw",
     )
-    dem_clipped = dem.astype("float32").copy()
-    dem_clipped[~np.isfinite(dem_clipped)] = dem_meta_clip["nodata"]
+    dem_clip_out = dem_clip.astype("float32")
+    dem_clip_out[~np.isfinite(dem_clip_out)] = dem_meta_clip["nodata"]
 
     dem_clipped_src_path = out_dir / "dem_clipped_src_crs.tif"
     with rasterio.open(dem_clipped_src_path, "w", **dem_meta_clip) as dst:
-        dst.write(dem_clipped, 1)
+        dst.write(dem_clip_out, 1)
 
-    # If DEM CRS is geographic (degrees) or differs from our chosen metric CRS,
-    # reproject the *clipped* DEM to metric CRS for all subsequent calculations.
-    if dem_crs_in.is_geographic or dem_crs_in != metric_crs:
+    # --------------------------------------------------------------
+    # 2) Reproject clipped DEM to metric CRS if needed
+    # --------------------------------------------------------------
+    dem_reprojected = False
+    if getattr(dem_crs_in, "is_geographic", False) or (dem_crs_in != metric_crs):
         dem_clipped_path = out_dir / "dem_clipped.tif"
-        _reproject_raster(
-            src_path=dem_clipped_src_path,
-            dst_path=dem_clipped_path,
-            dst_crs=metric_crs,
-            resampling=Resampling.bilinear,
+        _reproject_raster_singleband(
+            dem_clipped_src_path, dem_clipped_path, metric_crs, resampling=Resampling.bilinear
         )
-        dem_crs = metric_crs
+        dem_processing_path = dem_clipped_path
+        dem_crs_processing = metric_crs
+        dem_reprojected = True
     else:
-        dem_clipped_path = dem_clipped_src_path
-        dem_crs = dem_crs_in
+        dem_processing_path = dem_clipped_src_path
+        dem_crs_processing = dem_crs_in
+
+    # Ensure parcels in processing CRS
+    grid_gdf = parcels.to_crs(dem_crs_processing)
+    grid_gdf = _ensure_grid_id(grid_gdf).copy()
 
     # --------------------------------------------------------------
-    # 1. DEM conditioning with pysheds (fill pits / flats)
+    # 3) DEM conditioning (pysheds)
     # --------------------------------------------------------------
-    grid_cond = Grid.from_raster(str(dem_clipped_path))
-    dem_raw = grid_cond.read_raster(str(dem_clipped_path))
+    grid_cond = Grid.from_raster(str(dem_processing_path))
+    dem_raw = grid_cond.read_raster(str(dem_processing_path))
 
     pit_filled = grid_cond.fill_pits(dem_raw)
     flooded = grid_cond.fill_depressions(pit_filled)
     inflated = grid_cond.resolve_flats(flooded)
 
-    with rasterio.open(dem_clipped_path) as src:
-        filled_profile = src.profile.copy()
-
-    filled_profile.update(dtype="float32", nodata=-9999.0, count=1, compress="lzw")
-    dem_filled_arr = np.where(
-        np.isfinite(inflated), inflated.astype("float32"), filled_profile["nodata"]
-    )
+    with rasterio.open(dem_processing_path) as src:
+        base_profile = src.profile.copy()
+        dem_res_m = float(abs(src.res[0]))
 
     dem_filled_path = out_dir / "dem_filled.tif"
-    with rasterio.open(dem_filled_path, "w", **filled_profile) as dst:
-        dst.write(dem_filled_arr, 1)
-
-    with rasterio.open(dem_filled_path) as src:
-        dem_res = float(abs(src.res[0]))
+    _write_float_tif(dem_filled_path, inflated, base_profile, nodata=-9999.0)
 
     # --------------------------------------------------------------
-    # 2. Use parcels as grid; ensure grid_id
-    # --------------------------------------------------------------
-    grid_gdf = _ensure_grid_id(parcels.to_crs(dem_crs)).copy()
-
-    # --------------------------------------------------------------
-    # 3. Slope (degrees) from DEM gradients
+    # 4) Slope (degrees)
     # --------------------------------------------------------------
     slope_path = out_dir / "slope_deg.tif"
     with rasterio.open(dem_filled_path) as src:
@@ -271,33 +266,26 @@ def run_pec_analysis(
         dem_profile = src.profile.copy()
         res_x, res_y = src.res
 
-    gy, gx = np.gradient(dem_data.filled(np.nan), res_y, res_x)
+    arr = dem_data.filled(np.nan)
+    gy, gx = np.gradient(arr, res_y, res_x)
     slope_rad = np.arctan(np.sqrt(gx**2 + gy**2))
     slope_deg = np.degrees(slope_rad)
-    slope_arr = np.where(np.isfinite(dem_data), slope_deg, np.nan)
+    slope_deg = np.where(np.isfinite(arr), slope_deg, np.nan)
 
-    slope_profile = dem_profile.copy()
-    slope_profile.update(dtype="float32", nodata=-9999.0, count=1, compress="lzw")
-    slope_out = np.where(
-        np.isfinite(slope_arr), slope_arr.astype("float32"), slope_profile["nodata"]
-    )
-    with rasterio.open(slope_path, "w", **slope_profile) as dst:
-        dst.write(slope_out, 1)
+    _write_float_tif(slope_path, slope_deg, dem_profile, nodata=-9999.0)
 
     # --------------------------------------------------------------
-    # 4. Zonal stats: DEM + slope
+    # 5) Zonal stats: DEM + slope
     # --------------------------------------------------------------
     dem_stats = zonal_stats(
-        grid_gdf,
-        str(dem_filled_path),
+        grid_gdf, str(dem_filled_path),
         stats=["min", "max", "mean", "median", "std"],
-        nodata=filled_profile["nodata"],
+        nodata=-9999.0
     )
     slope_stats = zonal_stats(
-        grid_gdf,
-        str(slope_path),
+        grid_gdf, str(slope_path),
         stats=["mean", "median"],
-        nodata=slope_profile["nodata"],
+        nodata=-9999.0
     )
 
     grid_gdf["dem_min"] = [d["min"] for d in dem_stats]
@@ -309,13 +297,12 @@ def run_pec_analysis(
     grid_gdf["slp_median"] = [d["median"] for d in slope_stats]
 
     # --------------------------------------------------------------
-    # 5. Local relative elevation (DEM – neighbourhood mean)
+    # 6) PREI: neighbourhood mean (250 m default) + relative elevation
     # --------------------------------------------------------------
-    dem_mean_path = out_dir / "dem_mean_250m.tif"
-
-    radius_pixels = max(1, int(neighbourhood_radius_m / dem_res))
+    radius_pixels = max(1, int(neighbourhood_radius_m / dem_res_m))
     kernel_size = radius_pixels * 2 + 1
 
+    dem_mean_path = out_dir / "dem_mean_250m.tif"
     with rasterio.open(dem_filled_path) as src:
         dem_arr = src.read(1, masked=True).astype("float64")
         mean_profile = src.profile.copy()
@@ -324,95 +311,89 @@ def run_pec_analysis(
     valid_mask = np.isfinite(data)
 
     data_filled = np.where(valid_mask, data, 0.0)
-    sum_filtered = uniform_filter(
-        data_filled, size=kernel_size, mode="constant", cval=0.0
-    )
-    count_filtered = uniform_filter(
-        valid_mask.astype("float64"), size=kernel_size, mode="constant", cval=0.0
-    )
+    sum_filtered = uniform_filter(data_filled, size=kernel_size, mode="constant", cval=0.0)
+    count_filtered = uniform_filter(valid_mask.astype("float64"), size=kernel_size, mode="constant", cval=0.0)
 
     mean_arr = np.where(count_filtered > 0, sum_filtered / count_filtered, np.nan)
+    _write_float_tif(dem_mean_path, mean_arr, mean_profile, nodata=-9999.0)
 
-    mean_profile.update(dtype="float32", nodata=-9999.0, count=1, compress="lzw")
-    mean_out = np.where(
-        np.isfinite(mean_arr), mean_arr.astype("float32"), mean_profile["nodata"]
-    )
-    with rasterio.open(dem_mean_path, "w", **mean_profile) as dst:
-        dst.write(mean_out, 1)
-
-    # Relative elevation
     dem_rel_path = out_dir / "dem_relative.tif"
     with rasterio.open(dem_filled_path) as src_a, rasterio.open(dem_mean_path) as src_b:
         a = src_a.read(1).astype("float64")
         b = src_b.read(1).astype("float64")
         prof = src_a.profile.copy()
-        nodata_a = src_a.nodata
-        nodata_b = src_b.nodata
+        na = src_a.nodata
+        nb = src_b.nodata
 
-        if nodata_a is not None:
-            a = np.where(a == nodata_a, np.nan, a)
-        if nodata_b is not None:
-            b = np.where(b == nodata_b, np.nan, b)
+        if na is not None:
+            a = np.where(a == na, np.nan, a)
+        if nb is not None:
+            b = np.where(b == nb, np.nan, b)
 
         dem_rel = a - b
-        prof.update(dtype=rasterio.float32, nodata=-9999.0, count=1, compress="lzw")
-        out_rel = np.where(
-            np.isfinite(dem_rel), dem_rel.astype("float32"), prof["nodata"]
-        )
-        with rasterio.open(dem_rel_path, "w", **prof) as dst:
-            dst.write(out_rel, 1)
+
+    _write_float_tif(dem_rel_path, dem_rel, prof, nodata=-9999.0)
 
     rel_stats = zonal_stats(
-        grid_gdf,
-        str(dem_rel_path),
+        grid_gdf, str(dem_rel_path),
         stats=["mean", "min", "max"],
-        nodata=prof["nodata"],
+        nodata=-9999.0
     )
     grid_gdf["rel_mean"] = [d["mean"] for d in rel_stats]
     grid_gdf["rel_min"] = [d["min"] for d in rel_stats]
     grid_gdf["rel_max"] = [d["max"] for d in rel_stats]
 
     # --------------------------------------------------------------
-    # 6. Flow direction / accumulation / streams / HAND with pysheds
+    # 7) Flow direction / accumulation / streams / HAND (pysheds)
     # --------------------------------------------------------------
-    hand_path = out_dir / "hand.tif"
-
     grid = Grid.from_raster(str(dem_filled_path))
-    dem_for_flow = grid.read_raster(str(dem_filled_path))
-    dem_for_flow = grid.resolve_flats(dem_for_flow)
+    dem_flow = grid.read_raster(str(dem_filled_path))
+    dem_flow = grid.resolve_flats(dem_flow)
 
     dirmap = (64, 128, 1, 2, 4, 8, 16, 32)
-    fdir = grid.flowdir(dem_for_flow, dirmap=dirmap)
+    fdir = grid.flowdir(dem_flow, dirmap=dirmap)
     acc = grid.accumulation(fdir, dirmap=dirmap)
 
     stream_mask = acc >= stream_threshold
-    hand = grid.compute_hand(fdir, dem_for_flow, stream_mask)
+    hand = grid.compute_hand(fdir, dem_flow, stream_mask)
 
+    # Save rasters requested
+    fdir_path = out_dir / "flowdir.tif"
+    facc_path = out_dir / "flowacc.tif"
+    streams_path = out_dir / "streams.tif"
+    hand_path = out_dir / "hand.tif"
+
+    # Use base profile from dem_filled
     with rasterio.open(dem_filled_path) as src:
-        base_profile = src.profile.copy()
+        flow_profile = src.profile.copy()
 
-    hand_profile = base_profile.copy()
-    hand_profile.update(dtype="float32", nodata=-9999.0, count=1, compress="lzw")
-    hand_out = hand.astype("float32")
-    hand_out[~np.isfinite(hand_out)] = hand_profile["nodata"]
-    with rasterio.open(hand_path, "w", **hand_profile) as dst:
-        dst.write(hand_out, 1)
+    # flowdir is integer
+    _write_int_tif(fdir_path, fdir, flow_profile, dtype="int32", nodata_val=-9999)
+    # flowacc is float
+    _write_float_tif(facc_path, acc, flow_profile, nodata=-9999.0)
+    # streams mask 0/1
+    _write_uint8_tif(streams_path, stream_mask.astype("uint8"), flow_profile, nodata_val=0)
+    # hand
+    _write_float_tif(hand_path, hand, flow_profile, nodata=-9999.0)
 
     hand_stats = zonal_stats(
-        grid_gdf, str(hand_path), stats=["min", "mean"], nodata=hand_profile["nodata"]
+        grid_gdf, str(hand_path),
+        stats=["min", "mean"],
+        nodata=-9999.0
     )
     grid_gdf["hand_min"] = [d["min"] for d in hand_stats]
     grid_gdf["hand_mean"] = [d["mean"] for d in hand_stats]
 
     # --------------------------------------------------------------
-    # 7. PEC indicators & classification
+    # 8) PEC indicators + classification
     # --------------------------------------------------------------
     grid_gdf["relief"] = grid_gdf["dem_max"] - grid_gdf["dem_min"]
     grid_gdf["flat_flag"] = grid_gdf["slp_mean"] < 1.5
     grid_gdf["prei"] = grid_gdf["rel_mean"]
     grid_gdf["hand_score"] = grid_gdf["hand_min"]
     grid_gdf["retain_tag"] = np.where(
-        (grid_gdf["prei"] <= -0.5) & (grid_gdf["hand_score"] <= 1.5), 1, 0
+        (grid_gdf["prei"] <= -0.5) & (grid_gdf["hand_score"] <= 1.5),
+        1, 0
     )
 
     cols_to_fill = ["prei", "hand_score", "relief", "slp_mean"]
@@ -438,11 +419,40 @@ def run_pec_analysis(
     grid_gdf["pec_code"] = grid_gdf["pec_class"].map(pec_mapping).astype("Int32")
 
     # --------------------------------------------------------------
-    # 8. Diagnostics (helps explain missing classes in the app UI)
+    # 9) Export parcel KML (fallback GeoJSON)
     # --------------------------------------------------------------
-    _counts = grid_gdf["pec_class"].value_counts().to_dict()
-    class_counts_full = {k: int(_counts.get(k, 0)) for k in pec_mapping.keys()}
+    kml_path = out_dir / "parcel_level_PEC.kml"
+    geojson_path = out_dir / "parcel_level_PEC.geojson"
+    kml_written = False
 
+    kml_fields = [c for c in ["grid_id", "pec_class", "pec_code", "prei", "hand_score", "relief", "slp_mean"] if c in grid_gdf.columns]
+    gdf_kml = grid_gdf[kml_fields + ["geometry"]].to_crs(epsg=4326).copy()
+
+    # Make sure KML-friendly field types
+    for c in kml_fields:
+        if c in ["pec_class"]:
+            gdf_kml[c] = gdf_kml[c].astype(str)
+        elif c in ["pec_code"]:
+            gdf_kml[c] = gdf_kml[c].astype("Int64").astype(str)
+        else:
+            # keep numeric as is; KML driver can be picky, but usually OK
+            pass
+
+    try:
+        gdf_kml.to_file(kml_path, driver="KML")
+        kml_written = True
+    except Exception:
+        # fallback
+        gdf_kml.to_file(geojson_path, driver="GeoJSON")
+        kml_written = False
+
+    # --------------------------------------------------------------
+    # 10) Diagnostics + output file list (for ZIP download)
+    # --------------------------------------------------------------
+    counts = grid_gdf["pec_class"].value_counts().to_dict()
+    class_counts_full = {k: int(counts.get(k, 0)) for k in pec_mapping.keys()}
+
+    # debug counts: why Flat&Pressured could be zero
     if rainfall_mm and rainfall_mm > 0:
         low_thresh_used = 1.5 + 0.01 * rainfall_mm
         med_thresh_used = 3.0 + 0.01 * rainfall_mm
@@ -454,9 +464,7 @@ def run_pec_analysis(
 
     flat_count = int((grid_gdf["slp_mean"] < 1.5).sum())
     hand_le_med = int((grid_gdf["hand_score"] <= med_thresh_used).sum())
-    flat_and_hand = int(
-        ((grid_gdf["slp_mean"] < 1.5) & (grid_gdf["hand_score"] <= med_thresh_used)).sum()
-    )
+    flat_and_hand = int(((grid_gdf["slp_mean"] < 1.5) & (grid_gdf["hand_score"] <= med_thresh_used)).sum())
     low_lying_rule = (
         (prei_used <= -0.5)
         & (grid_gdf["hand_score"] <= low_thresh_used)
@@ -464,17 +472,31 @@ def run_pec_analysis(
     )
     low_lying_rule_count = int(low_lying_rule.sum())
 
+    output_files = [
+        str(dem_clipped_src_path),
+        str(out_dir / "dem_clipped.tif"),     # exists only if reprojected
+        str(dem_filled_path),
+        str(slope_path),
+        str(dem_mean_path),
+        str(dem_rel_path),
+        str(fdir_path),
+        str(facc_path),
+        str(streams_path),
+        str(hand_path),
+    ]
+    output_files = [f for f in output_files if os.path.exists(f)]
+
     diagnostics = {
         "n_parcels": int(len(grid_gdf)),
-        "dem_res_m": float(dem_res),
+        "dem_res_m": float(dem_res_m),
         "neighbourhood_radius_m": float(neighbourhood_radius_m),
         "neighbourhood_radius_pixels": int(radius_pixels),
         "stream_threshold": int(stream_threshold),
         "rainfall_mm": float(rainfall_mm),
 
         "dem_crs_input": str(dem_crs_in),
-        "dem_crs_processing": str(dem_crs),
-        "dem_reprojected": bool(dem_crs_in != dem_crs),
+        "dem_crs_processing": str(dem_crs_processing),
+        "dem_reprojected": bool(dem_reprojected),
         "dem_input_is_geographic": bool(getattr(dem_crs_in, "is_geographic", False)),
 
         "pec_class_counts": class_counts_full,
@@ -483,11 +505,14 @@ def run_pec_analysis(
         "hand_le_med_thresh": hand_le_med,
         "flat_and_hand": flat_and_hand,
         "low_lying_rule_count": low_lying_rule_count,
-        "flat_pressured_count": class_counts_full.get(
-            "Flat & Pressured (High Flood Exposure Risk)", 0
-        ),
+        "flat_pressured_count": class_counts_full.get("Flat & Pressured (High Flood Exposure Risk)", 0),
         "hand_low_thresh_used": float(low_thresh_used),
         "hand_med_thresh_used": float(med_thresh_used),
+
+        "pec_out_dir": str(out_dir),
+        "pec_output_files": output_files,
+        "pec_kml_path": str(kml_path) if (kml_written and os.path.exists(kml_path)) else None,
+        "pec_geojson_path": str(geojson_path) if ((not kml_written) and os.path.exists(geojson_path)) else None,
     }
 
     return grid_gdf, diagnostics
