@@ -15,7 +15,6 @@ def build_pec_map(parcels_pec: gpd.GeoDataFrame, rainfall_mm: float = 0.0):
         raise ValueError("PEC GeoDataFrame has no CRS.")
 
     gdf = parcels_pec.to_crs(epsg=4326).copy()
-
     centroids = gdf.geometry.centroid
     center = [centroids.y.mean(), centroids.x.mean()]
 
@@ -36,7 +35,7 @@ def build_pec_map(parcels_pec: gpd.GeoDataFrame, rainfall_mm: float = 0.0):
     for col, alias in [
         ("grid_id", "Grid ID"),
         ("pec_class", "PEC class"),
-        ("prei", "PREI (rel. elev.)"),
+        ("prei", "PREI"),
         ("hand_score", "HAND score"),
         ("relief", "Relief (m)"),
         ("slp_mean", "Mean slope (deg)"),
@@ -86,5 +85,4 @@ def build_pec_map(parcels_pec: gpd.GeoDataFrame, rainfall_mm: float = 0.0):
 
     m.get_root().html.add_child(folium.Element(legend_html))
     folium.LayerControl().add_to(m)
-
     return m
