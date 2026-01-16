@@ -15,10 +15,6 @@ It reproduces your logic:
 6. Zonal stats per parcel
 7. PEC indicators + classification into 4 classes
 8. Optional rainfall-adjusted PEC (thresholds modified by rainfall_mm)
-
-✅ Change added (NO analysis change):
-- Return `outputs` dict with GeoTIFF paths so the Streamlit page can download them.
-- Also write a few extra rasters (flow direction / accumulation / streams mask) from arrays already computed.
 """
 
 from pathlib import Path
@@ -26,11 +22,72 @@ import numpy as np
 import geopandas as gpd
 import rasterio
 from rasterio.mask import mask
+from rasterio.warp import calculate_default_transform, reproject, Resampling
 from rasterstats import zonal_stats
 from shapely.geometry import mapping
 from pysheds.grid import Grid
 from scipy.ndimage import uniform_filter
 import pandas as pd
+
+
+# Default processing CRS (metric). Matches your original PEC script.
+DEFAULT_METRIC_EPSG = 5234
+
+
+def _pick_metric_crs(parcels_crs, dem_crs):
+    """Choose a metric (projected, metres) CRS for slope/PREI/HAND calculations."""
+    if parcels_crs is not None and parcels_crs.is_projected:
+        return parcels_crs
+    if dem_crs is not None and dem_crs.is_projected:
+        return dem_crs
+    return rasterio.crs.CRS.from_epsg(DEFAULT_METRIC_EPSG)
+
+
+def _reproject_raster(
+    src_path: Path,
+    dst_path: Path,
+    dst_crs: rasterio.crs.CRS,
+    resampling: Resampling = Resampling.bilinear,
+):
+    """Reproject a single-band GeoTIFF to dst_crs and write to dst_path."""
+    with rasterio.open(src_path) as src:
+        if src.crs is None:
+            raise ValueError("DEM has no CRS; cannot reproject.")
+
+        transform, width, height = calculate_default_transform(
+            src.crs, dst_crs, src.width, src.height, *src.bounds
+        )
+
+        profile = src.profile.copy()
+        profile.update(
+            crs=dst_crs,
+            transform=transform,
+            width=width,
+            height=height,
+            dtype="float32",
+            nodata=-9999.0,
+            count=1,
+            compress="lzw",
+        )
+
+        dest = np.full((height, width), profile["nodata"], dtype="float32")
+
+        reproject(
+            source=rasterio.band(src, 1),
+            destination=dest,
+            src_transform=src.transform,
+            src_crs=src.crs,
+            dst_transform=transform,
+            dst_crs=dst_crs,
+            resampling=resampling,
+            src_nodata=src.nodata,
+            dst_nodata=profile["nodata"],
+        )
+
+    with rasterio.open(dst_path, "w", **profile) as dst:
+        dst.write(dest, 1)
+
+    return dst_path
 
 
 # ------------------------------------------------------------------
@@ -102,14 +159,10 @@ def run_pec_analysis(
     Returns
     -------
     parcels_pec : GeoDataFrame
-        Parcels with PEC indicators and 'pec_class' string + 'pec_code' int.
     diagnostics : dict
-        Basic diagnostic info (counts, thresholds, etc.).
-    outputs : dict
-        Paths to GeoTIFF outputs (added for download; no analysis change).
     """
 
-    # Where to drop intermediate rasters (optional, mainly for debugging + downloads)
+    # Where to drop intermediate rasters (optional, mainly for debugging)
     base_dir = Path(__file__).resolve().parents[1]
     out_dir = base_dir / "outputs" / "individual" / "pec"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -122,17 +175,23 @@ def run_pec_analysis(
         raise ValueError("Parcels layer has no CRS; please define CRS and re-save.")
 
     with rasterio.open(dem_path) as src:
-        dem_crs = src.crs
-        dem_meta = src.meta.copy()
-        parcels = parcels.to_crs(dem_crs)
+        if src.crs is None:
+            raise ValueError("DEM has no CRS; please define CRS before running PEC.")
 
-        # mask DEM to union of parcels
-        boundary_geom = [mapping(parcels.unary_union)]
+        dem_crs_in = src.crs
+        dem_meta_in = src.meta.copy()
+
+        # Choose a metric CRS so DEM resolution + slope are in metres (critical).
+        metric_crs = _pick_metric_crs(parcels.crs, dem_crs_in)
+
+        # Mask DEM to parcels in DEM CRS first (cheap & avoids reprojection of whole DEM).
+        parcels_in_dem = parcels.to_crs(dem_crs_in)
+        boundary_geom = [mapping(parcels_in_dem.unary_union)]
         out_image, out_transform = mask(src, boundary_geom, crop=True)
 
     # DEM as float, clean nodata & extreme negatives
     dem = out_image[0].astype("float64")
-    nodata_in = dem_meta.get("nodata", None)
+    nodata_in = dem_meta_in.get("nodata", None)
     if nodata_in is not None:
         dem = np.where(dem == nodata_in, np.nan, dem)
     dem = np.where(dem < -1000, np.nan, dem)
@@ -140,10 +199,9 @@ def run_pec_analysis(
     if not np.isfinite(dem).any():
         raise ValueError("DEM is empty or all nodata within the parcel extent.")
 
-    cellsize = float(abs(out_transform.a))
-
-    # Save clipped DEM
-    dem_meta.update(
+    # Save clipped DEM (in original DEM CRS)
+    dem_meta_clip = dem_meta_in.copy()
+    dem_meta_clip.update(
         height=dem.shape[0],
         width=dem.shape[1],
         transform=out_transform,
@@ -153,11 +211,26 @@ def run_pec_analysis(
         compress="lzw",
     )
     dem_clipped = dem.astype("float32").copy()
-    dem_clipped[~np.isfinite(dem_clipped)] = dem_meta["nodata"]
+    dem_clipped[~np.isfinite(dem_clipped)] = dem_meta_clip["nodata"]
 
-    dem_clipped_path = out_dir / "dem_clipped.tif"
-    with rasterio.open(dem_clipped_path, "w", **dem_meta) as dst:
+    dem_clipped_src_path = out_dir / "dem_clipped_src_crs.tif"
+    with rasterio.open(dem_clipped_src_path, "w", **dem_meta_clip) as dst:
         dst.write(dem_clipped, 1)
+
+    # If DEM CRS is geographic (degrees) or differs from our chosen metric CRS,
+    # reproject the *clipped* DEM to metric CRS for all subsequent calculations.
+    if dem_crs_in.is_geographic or dem_crs_in != metric_crs:
+        dem_clipped_path = out_dir / "dem_clipped.tif"
+        _reproject_raster(
+            src_path=dem_clipped_src_path,
+            dst_path=dem_clipped_path,
+            dst_crs=metric_crs,
+            resampling=Resampling.bilinear,
+        )
+        dem_crs = metric_crs
+    else:
+        dem_clipped_path = dem_clipped_src_path
+        dem_crs = dem_crs_in
 
     # --------------------------------------------------------------
     # 1. DEM conditioning with pysheds (fill pits / flats)
@@ -182,7 +255,7 @@ def run_pec_analysis(
         dst.write(dem_filled_arr, 1)
 
     with rasterio.open(dem_filled_path) as src:
-        dem_res = src.res[0]
+        dem_res = float(abs(src.res[0]))
 
     # --------------------------------------------------------------
     # 2. Use parcels as grid; ensure grid_id
@@ -237,7 +310,6 @@ def run_pec_analysis(
 
     # --------------------------------------------------------------
     # 5. Local relative elevation (DEM – neighbourhood mean)
-    #    using uniform_filter (same as your script)
     # --------------------------------------------------------------
     dem_mean_path = out_dir / "dem_mean_250m.tif"
 
@@ -290,7 +362,6 @@ def run_pec_analysis(
         with rasterio.open(dem_rel_path, "w", **prof) as dst:
             dst.write(out_rel, 1)
 
-    # Zonal stats on relative elevation
     rel_stats = zonal_stats(
         grid_gdf,
         str(dem_rel_path),
@@ -327,29 +398,6 @@ def run_pec_analysis(
     with rasterio.open(hand_path, "w", **hand_profile) as dst:
         dst.write(hand_out, 1)
 
-    # ✅ ADDED ONLY: write flow direction / accumulation / streams mask rasters (no analysis change)
-    fdir_path = out_dir / "flow_direction.tif"
-    acc_path = out_dir / "flow_accumulation.tif"
-    streams_path = out_dir / "streams_mask.tif"
-
-    fdir_profile = base_profile.copy()
-    fdir_profile.update(dtype="uint16", nodata=0, count=1, compress="lzw")
-    with rasterio.open(fdir_path, "w", **fdir_profile) as dst:
-        dst.write(np.array(fdir).astype("uint16"), 1)
-
-    acc_profile = base_profile.copy()
-    acc_profile.update(dtype="float32", nodata=-9999.0, count=1, compress="lzw")
-    acc_arr = np.array(acc).astype("float32")
-    acc_arr[~np.isfinite(acc_arr)] = acc_profile["nodata"]
-    with rasterio.open(acc_path, "w", **acc_profile) as dst:
-        dst.write(acc_arr, 1)
-
-    streams_profile = base_profile.copy()
-    streams_profile.update(dtype="uint8", nodata=0, count=1, compress="lzw")
-    with rasterio.open(streams_path, "w", **streams_profile) as dst:
-        dst.write(stream_mask.astype("uint8"), 1)
-
-    # HAND stats
     hand_stats = zonal_stats(
         grid_gdf, str(hand_path), stats=["min", "mean"], nodata=hand_profile["nodata"]
     )
@@ -370,10 +418,8 @@ def run_pec_analysis(
     cols_to_fill = ["prei", "hand_score", "relief", "slp_mean"]
     grid_gdf[cols_to_fill] = grid_gdf[cols_to_fill].fillna(0.0)
 
-    # Static PEC
     grid_gdf["pec_class_static"] = grid_gdf.apply(_classify_pec_static, axis=1)
 
-    # Rainfall-adjusted PEC
     if rainfall_mm and rainfall_mm > 0:
         grid_gdf["pec_class_rainfall"] = grid_gdf.apply(
             lambda r: _classify_pec_rainfall(r, rainfall_mm), axis=1
@@ -391,6 +437,33 @@ def run_pec_analysis(
     }
     grid_gdf["pec_code"] = grid_gdf["pec_class"].map(pec_mapping).astype("Int32")
 
+    # --------------------------------------------------------------
+    # 8. Diagnostics (helps explain missing classes in the app UI)
+    # --------------------------------------------------------------
+    _counts = grid_gdf["pec_class"].value_counts().to_dict()
+    class_counts_full = {k: int(_counts.get(k, 0)) for k in pec_mapping.keys()}
+
+    if rainfall_mm and rainfall_mm > 0:
+        low_thresh_used = 1.5 + 0.01 * rainfall_mm
+        med_thresh_used = 3.0 + 0.01 * rainfall_mm
+        prei_used = grid_gdf["prei"] - 0.002 * rainfall_mm
+    else:
+        low_thresh_used = 1.5
+        med_thresh_used = 3.0
+        prei_used = grid_gdf["prei"]
+
+    flat_count = int((grid_gdf["slp_mean"] < 1.5).sum())
+    hand_le_med = int((grid_gdf["hand_score"] <= med_thresh_used).sum())
+    flat_and_hand = int(
+        ((grid_gdf["slp_mean"] < 1.5) & (grid_gdf["hand_score"] <= med_thresh_used)).sum()
+    )
+    low_lying_rule = (
+        (prei_used <= -0.5)
+        & (grid_gdf["hand_score"] <= low_thresh_used)
+        & (grid_gdf["relief"] <= 3)
+    )
+    low_lying_rule_count = int(low_lying_rule.sum())
+
     diagnostics = {
         "n_parcels": int(len(grid_gdf)),
         "dem_res_m": float(dem_res),
@@ -398,21 +471,23 @@ def run_pec_analysis(
         "neighbourhood_radius_pixels": int(radius_pixels),
         "stream_threshold": int(stream_threshold),
         "rainfall_mm": float(rainfall_mm),
-        "pec_class_counts": grid_gdf["pec_class"].value_counts().to_dict(),
+
+        "dem_crs_input": str(dem_crs_in),
+        "dem_crs_processing": str(dem_crs),
+        "dem_reprojected": bool(dem_crs_in != dem_crs),
+        "dem_input_is_geographic": bool(getattr(dem_crs_in, "is_geographic", False)),
+
+        "pec_class_counts": class_counts_full,
+
+        "flat_count_slope_lt_1p5": flat_count,
+        "hand_le_med_thresh": hand_le_med,
+        "flat_and_hand": flat_and_hand,
+        "low_lying_rule_count": low_lying_rule_count,
+        "flat_pressured_count": class_counts_full.get(
+            "Flat & Pressured (High Flood Exposure Risk)", 0
+        ),
+        "hand_low_thresh_used": float(low_thresh_used),
+        "hand_med_thresh_used": float(med_thresh_used),
     }
 
-    # ✅ ADDED ONLY: paths for downloading outputs (no analysis change)
-    outputs = {
-        "workspace": str(out_dir),
-        "dem_clipped_tif": str(dem_clipped_path),
-        "dem_filled_tif": str(dem_filled_path),
-        "slope_deg_tif": str(slope_path),
-        "dem_mean_tif": str(dem_mean_path),
-        "prei_tif": str(dem_rel_path),
-        "hand_tif": str(hand_path),
-        "flow_direction_tif": str(fdir_path),
-        "flow_accumulation_tif": str(acc_path),
-        "streams_mask_tif": str(streams_path),
-    }
-
-    return grid_gdf, diagnostics, outputs
+    return grid_gdf, diagnostics
