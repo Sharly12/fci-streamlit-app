@@ -2,28 +2,20 @@
 import folium
 import geopandas as gpd
 
-
-# Same colours as in your matplotlib legend
 PEC_COLORS = {
-    "Low-lying Depressed (Retention Priority)": "#1f78b4",  # blue
-    "Flat & Pressured (High Flood Exposure Risk)": "#e31a1c",  # red
-    "Locally High & Disconnected": "#33a02c",  # green
-    "Moderate / Context-Dependent": "#ffd92f",  # yellow-ish
+    "Low-lying Depressed (Retention Priority)": "#1f78b4",
+    "Flat & Pressured (High Flood Exposure Risk)": "#e31a1c",
+    "Locally High & Disconnected": "#33a02c",
+    "Moderate / Context-Dependent": "#ffd92f",
 }
 
 
 def build_pec_map(parcels_pec: gpd.GeoDataFrame, rainfall_mm: float = 0.0):
-    """
-    Build an interactive Folium map showing PEC classes per parcel,
-    using the SAME class names & colours as your original script.
-    """
-
     if parcels_pec.crs is None:
         raise ValueError("PEC GeoDataFrame has no CRS.")
 
     gdf = parcels_pec.to_crs(epsg=4326).copy()
 
-    # Map centre
     centroids = gdf.geometry.centroid
     center = [centroids.y.mean(), centroids.x.mean()]
 
@@ -41,7 +33,6 @@ def build_pec_map(parcels_pec: gpd.GeoDataFrame, rainfall_mm: float = 0.0):
 
     tooltip_fields = []
     aliases = []
-
     for col, alias in [
         ("grid_id", "Grid ID"),
         ("pec_class", "PEC class"),
@@ -66,7 +57,6 @@ def build_pec_map(parcels_pec: gpd.GeoDataFrame, rainfall_mm: float = 0.0):
         ),
     ).add_to(m)
 
-    # Legend (same class labels & colours)
     title_suffix = f" — {int(rainfall_mm)} mm" if rainfall_mm and rainfall_mm > 0 else ""
     legend_html = f"""
     <div style="
