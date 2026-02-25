@@ -11,3 +11,10 @@ Placeholders (to be implemented):
 - uds_model: Upstream–Downstream Sensitivity
 - sei_model: Surrounding Exposure Index
 """
+
+import numpy as np
+
+# NumPy 2.4+ removed np.in1d; some pysheds versions still call it.
+# This alias restores compatibility without changing analysis behavior.
+if not hasattr(np, "in1d"):
+    np.in1d = np.isin
